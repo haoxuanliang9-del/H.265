@@ -1,0 +1,86 @@
+# ===================== 用户/AI 辅助产物 =====================
+# 本地中文学习文档（不入版本库）
+文档/
+# Trae AI 调试会话记录
+debug-startcompress-not-firing.md
+
+# ===================== IDE / 编辑器 =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===================== 构建产物 =====================
+build/
+build-debug/
+build-release/
+out/
+cmake-build-*/
+
+# 编译输出
+*.o
+*.obj
+*.lo
+*.la
+*.al
+*.libs
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.exe
+*.pyd
+*.pyc
+
+# Ninja / CMake / Make
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+Makefile
+*.cmake
+!CMakeLists.txt
+!source/cmake/*.cmake
+!source/cmake/*.in
+!source/common/CMakeLists.txt
+!source/encoder/CMakeLists.txt
+!source/dynamicHDR10/CMakeLists.txt
+!source/test/CMakeLists.txt
+!source/profile/CMakeLists.txt
+!source/profile/PPA/CMakeLists.txt
+!source/profile/vtune/CMakeLists.txt
+
+# x265 运行时输出
+*.yuv
+*.hevc
+*.h265
+*.265
+*.mp4
+*.mkv
+*.log
+
+# ===================== Windows =====================
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ===================== Mercurial 残留 =====================
+.hg/
+.hgignore
