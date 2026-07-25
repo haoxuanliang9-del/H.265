@@ -1427,6 +1427,7 @@ void Encoder::findSceneCuts(x265_picture *pic, bool& bDup, double maxUVSad, doub
  *         negative on malloc error or abort */
 int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
 {
+    // 【不重要】CHECKED_BUILD/DEBUG 下的内部错误中断检查
 #if CHECKED_BUILD || _DEBUG
     if (g_checkFailures)
     {
@@ -1434,31 +1435,38 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
         return -1;
     }
 #endif
-    if (m_aborted)
-        return -1;
-    const x265_picture* inputPic = NULL;
-    static int written = 0, read = 0;
-    bool dontRead = false;
-    bool bdropFrame = false;
-    bool dropflag = false;
-    bool isMaxThres = false;
-    bool isHardSC = false;
+    if (m_aborted)                                 // 编码器已被标记中止，理解结束编码。m_aborted在获取一帧编码帧失败时被设置为true
+        return -1;                                 // 返回 -1 表示失败
+    const x265_picture* inputPic = NULL;           // 真正送入后续流程的输入图像指针（可能来自 pic_in 或帧复制缓冲）
+    static int written = 0, read = 0;              // 帧复制模式下的缓冲区（帧复用模式有两个帧缓冲区用于对比前后帧）写入/读取计数
+    bool dontRead = false;                         // 帧复制模式下标记本帧不读取新输入（复用上一帧）
+    bool bdropFrame = false;            // 直方图完全一致时置位，表示当前帧可作为重复帧处理
+    bool dropflag = false;              // 帧复制流程的执行标记：可由 bdropFrame、PSNR 达到相似阈值，或当前帧为场景切触发
+    bool isMaxThres = false;                       // 当前场景切的直方图差异超过最大阈值时置 true，后面lookahead会据此决定帧类型
+    bool isHardSC = false;                         // 切换足够剧烈，但未必达到最大阈值
+
+    // 【不重要】上一帧导出图像的资源回收（释放分析数据、减引用计数、回收 DPB）
     if (m_exportedPic)
     {
         if (!m_param->bUseAnalysisFile && m_param->analysisSave)
             x265_free_analysis_data(m_param, &m_exportedPic->m_analysisData);
-        ATOMIC_DEC(&m_exportedPic->m_countRefEncoders);
+        ATOMIC_DEC(&m_exportedPic->m_countRefEncoders);  // 原子递减上一输出帧的引用计数
         m_exportedPic = NULL;
-        m_dpb->recycleUnreferenced();
+        m_dpb->recycleUnreferenced();              // 回收 DPB 中无引用帧
     }
-    if ((pic_in && (!m_param->chunkEnd || (m_encodedFrameNum < m_param->chunkEnd))) || (m_param->bEnableFrameDuplication && !pic_in && (read < written)))
+    if ((pic_in && (!m_param->chunkEnd || (m_encodedFrameNum < m_param->chunkEnd))) || (m_param->bEnableFrameDuplication && !pic_in && (read < written)))  // 输入分发条件：有新输入且未到 chunkEnd，或帧复制模式下还有未读缓冲帧
     {
+        // ============================================================
+        //  基于直方图的场景切检测
+        // 进入条件：bHistBasedSceneCut 且有新输入 pic_in
+        // 正常编码不会走，仅开启直方图场景切模式时执行：计算色度平面尺寸、
+        // 生成直方图、求 SAD、查找场景切并标记丢帧/硬场景切
+        // ============================================================
         if (m_param->bHistBasedSceneCut && pic_in)
         {
             x265_picture *pic = (x265_picture *) pic_in;
             if (pic->poc == 0)
             {
-                /* for entire encode compute the chroma plane sizes only once */
                 for (int i = 1; i < x265_cli_csps[m_param->internalCsp].planes; i++)
                     m_planeSizes[i] = (pic->width >> x265_cli_csps[m_param->internalCsp].width[i]) * (pic->height >> x265_cli_csps[m_param->internalCsp].height[i]);
             }
@@ -1469,10 +1477,13 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 findSceneCuts(pic, bdropFrame, maxUVSad, edgeSad, isMaxThres, isHardSC);
             }
         }
-        if ((m_param->bEnableFrameDuplication && !pic_in && (read < written)))
-            dontRead = true;
+
+        if ((m_param->bEnableFrameDuplication && !pic_in && (read < written)))  // 帧复制模式下无新输入但有未读缓冲
+            dontRead = true;                        // 不读取新帧
         else
         {
+            // 【不重要】这里使用m_latestParam表示forceFlush是编码器外部传来的参数，
+            // forceFlush在正常编码时通常一直保持 0。
             if (m_latestParam->forceFlush == 1)
             {
                 m_lookahead->setLookaheadQueue();
@@ -1483,6 +1494,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 m_lookahead->m_filled = false;
                 m_latestParam->forceFlush = 0;
             }
+            // 【不重要】输入位深合法性校验（错误处理）
             if (pic_in->bitDepth < 8 || pic_in->bitDepth > 16)
             {
                 x265_log(m_param, X265_LOG_ERROR, "Input bit depth (%d) must be between 8 and 16\n",
@@ -1490,6 +1502,13 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 return -1;
             }
         }
+
+        // ============================================================
+        //  帧复制去重处理
+        // 进入条件：bEnableFrameDuplication
+        // 正常编码不会走，仅开启帧复制模式时执行：双缓冲入帧、PSNR 相似度判丢帧、
+        // doubling/tripling 标记转换，决定 inputPic 取自缓冲
+        // ============================================================
         if (m_param->bEnableFrameDuplication)
         {
             double psnrWeight = 0;
@@ -1517,9 +1536,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                             dropflag = true;
                     }
                     else
-                    {
                         dropflag = true;
-                    }
                 }
                 else if (m_param->bEnableFrameDuplication)
                 {
@@ -1556,18 +1573,18 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             }
         }
         else
-            inputPic = pic_in;
-        Frame *inFrame;
-        x265_param *p = (m_reconfigure || m_reconfigureRc) ? m_latestParam : m_param;
-        if (m_dpb->m_freeList.empty())
+            inputPic = pic_in;                       // 非帧复制模式，直接用 pic_in 作为输入
+
+        // ----------Frame 对象分配/复用 ----------
+        Frame *inFrame;                             // 本次要构造的帧对象
+        x265_param *p = (m_reconfigure || m_reconfigureRc) ? m_latestParam : m_param;  // 参数重配时用最新参数，否则用默认
+        if (m_dpb->m_freeList.empty())              // 空闲链表为空，需新建 Frame
         {
             inFrame = new Frame;
-            inFrame->m_encodeStartTime = x265_mdate();
-            if (inFrame->create(p, inputPic->quantOffsets))
+            inFrame->m_encodeStartTime = x265_mdate();  // 记录编码起始时间戳（用于耗时统计）
+            if (inFrame->create(p, inputPic->quantOffsets))  // 初始化Frame，只是创建容器并未实际把inputPic的内容复制到Frame中
             {
-                /* the first PicYuv created is asked to generate the CU and block unit offset
-                 * arrays which are then shared with all subsequent PicYuv (orig and recon) 
-                 * allocated by this top level encoder */
+                // 【不重要】补充初始化一些与图像尺寸、编码块布局有关的辅助数据
                 if (m_sps.cuOffsetY)
                 {
                     inFrame->m_fencPic->m_cuOffsetY = m_sps.cuOffsetY;
@@ -1610,7 +1627,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             }
             else
             {
-                m_aborted = true;
+                m_aborted = true;                   // Frame::create 失败 → 中止编码（错误处理）
                 x265_log(m_param, X265_LOG_ERROR, "memory allocation failure, aborting encode\n");
                 inFrame->destroy();
                 delete inFrame;
@@ -1619,20 +1636,21 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
         }
         else
         {
-            inFrame = m_dpb->m_freeList.popBack();
-            inFrame->m_encodeStartTime = x265_mdate();
-            /* Set lowres scencut and satdCost here to aovid overwriting ANALYSIS_READ
-               decision by lowres init*/
-            inFrame->m_lowres.bScenecut = false;
-            inFrame->m_lowres.satdCost = (int64_t)-1;
-            inFrame->m_lowresInit = false;
-            inFrame->m_isInsideWindow = 0;
+            inFrame = m_dpb->m_freeList.popBack();  // 从空闲链表复用 Frame 对象（避免重复分配）
+            inFrame->m_encodeStartTime = x265_mdate();  // 重置编码起始时间戳
+            inFrame->m_lowres.bScenecut = false;    // 复位低分辨率场景切标志
+            inFrame->m_lowres.satdCost = (int64_t)-1;  // 复位 SATD 代价（-1 表示未计算）
+            inFrame->m_lowresInit = false;          // 复位低分辨率初始化标志
+            inFrame->m_isInsideWindow = 0;          // 复位场景切窗口标志
         }
-        /* Copy input picture into a Frame and PicYuv, send to lookahead */
-        inFrame->m_fencPic->copyFromPicture(*inputPic, *m_param, m_sps.conformanceWindow.rightOffset, m_sps.conformanceWindow.bottomOffset);
-        inFrame->m_poc       = ++m_pocLast;
-        inFrame->m_userData  = inputPic->userData;
-        inFrame->m_pts       = inputPic->pts;
+
+        // ---------- 拷贝像素与核心元数据到 inFrame ----------
+        inFrame->m_fencPic->copyFromPicture(*inputPic, *m_param, m_sps.conformanceWindow.rightOffset, m_sps.conformanceWindow.bottomOffset);  // 把输入图像像素拷入 fencPic（含一致性窗口裁剪）
+        inFrame->m_poc       = ++m_pocLast;        // 分配 POC（图像顺序号，递增）
+        inFrame->m_userData  = inputPic->userData;  // 回传用户数据指针
+        inFrame->m_pts       = inputPic->pts;       // 显示时间戳
+
+        // 【不重要】设置m_lowres的一些参数，用于后面lookahead 决定 GOP、I/IDR 帧和 RADL 策略。
         if (m_param->bHistBasedSceneCut)
         {
             inFrame->m_lowres.bScenecut = (inputPic->frameData.bScenecut == 1) ? true : false;
@@ -1640,6 +1658,13 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             if (m_param->radl && m_param->keyframeMax != m_param->keyframeMin)
                 inFrame->m_lowres.m_bIsHardScenecut = isHardSC;
         }
+
+        // ============================================================
+        // 场景切感知 QP（场景切前后帧用高QP降低码率） 
+        // 进入条件：bEnableSceneCutAwareQp（启用场景切感知 QP） 且是2-pass编码（有分析数据）
+        // 若当前帧在第一遍统计中是场景切（发生场景切换的第一帧），
+        // 则给它前面仍滞留在 lookahead 输入队列中的若干帧打上“场景切前窗口”标记，后续提高这些帧的 QP 来省码率。
+        // ============================================================
         if (m_param->bEnableSceneCutAwareQp && m_param->rc.bStatRead)
         {
             RateControlEntry * rcEntry = NULL;
@@ -1656,6 +1681,8 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 }
             }
         }
+
+        // 【不重要】启用直方图场景切和分析保存时，把当前帧已经计算出的直方图数据保存到帧分析数据中
         if (m_param->bHistBasedSceneCut && m_param->analysisSave)
         {
             memcpy(inFrame->m_analysisData.edgeHist, m_curEdgeHist, EDGE_BINS * sizeof(int32_t));
@@ -1666,19 +1693,24 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 memcpy(inFrame->m_analysisData.yuvHist[2], m_curYUVHist[2], HISTOGRAM_BINS * sizeof(int32_t));
             }
         }
-        inFrame->m_forceqp   = inputPic->forceqp;
-        inFrame->m_param     = (m_reconfigure || m_reconfigureRc) ? m_latestParam : m_param;
-        inFrame->m_picStruct = inputPic->picStruct;
+
+        inFrame->m_forceqp   = inputPic->forceqp;   // 强制 QP（用户编码器外部指定）
+        inFrame->m_param     = (m_reconfigure || m_reconfigureRc) ? m_latestParam : m_param;  // 热加载新编码器参数
+        inFrame->m_picStruct = inputPic->picStruct; // 图像结构
+        // 【不重要】场编码：记录场号
         if (m_param->bField && m_param->interlaceMode)
             inFrame->m_fieldNum = inputPic->fieldNum;
-        copyUserSEIMessages(inFrame, inputPic);
-        /*Copy Dolby Vision RPU from inputPic to frame*/
+        copyUserSEIMessages(inFrame, inputPic);     // 拷贝用户 SEI 消息到帧
+
+        // 【不重要】拷贝 Dolby Vision RPU 载荷
         if (inputPic->rpu.payloadSize)
         {
             inFrame->m_rpu.payloadSize = inputPic->rpu.payloadSize;
             inFrame->m_rpu.payload = new uint8_t[inputPic->rpu.payloadSize];
             memcpy(inFrame->m_rpu.payload, inputPic->rpu.payload, inputPic->rpu.payloadSize);
         }
+
+        // 【不重要】拷贝量化偏移表（按 CU 的 QP 偏移，用于局部码率控制）
         if (inputPic->quantOffsets != NULL)
         {
             int cuCount;
@@ -1688,12 +1720,19 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 cuCount = inFrame->m_lowres.maxBlocksInRow * inFrame->m_lowres.maxBlocksInCol;
             memcpy(inFrame->m_quantOffsets, inputPic->quantOffsets, cuCount * sizeof(float));
         }
-        if (m_pocLast == 0)
-            m_firstPts = inFrame->m_pts;
-        if (m_bframeDelay && m_pocLast == m_bframeDelay)
-            m_bframeDelayTime = inFrame->m_pts - m_firstPts;
-        /* Encoder holds a reference count until stats collection is finished */
-        ATOMIC_INC(&inFrame->m_countRefEncoders);
+
+        if (m_pocLast == 0)                         // 若为首帧
+            m_firstPts = inFrame->m_pts;            // PTS作为后续 DTS/延时计算基准
+        if (m_bframeDelay && m_pocLast == m_bframeDelay)  // m_bframeDelay：B 帧延迟（即B帧需要参考后面的I/P帧数量）
+            m_bframeDelayTime = inFrame->m_pts - m_firstPts;  // 计算 B 帧延迟时长，供 DTS 偏移计算（这里还在构建Frame阶段，供后面编码阶段的DTS计算）
+
+        ATOMIC_INC(&inFrame->m_countRefEncoders);   // 编码器持有引用计数，防止统计完成前被回收
+
+        // ============================================================
+        //  二pass CU Tree 读取
+        // 进入条件：开启 AQ/加权预测 且 cuTree 且 bStatRead
+        // 正常编码不会走，仅二pass cuTree 模式：读取 cuTree 数据；失败则中止
+        // ============================================================
         if ((m_param->rc.aqMode || m_param->bEnableWeightedPred || m_param->bEnableWeightedBiPred) &&
             (m_param->rc.cuTree && m_param->rc.bStatRead))
         {
@@ -1703,13 +1742,17 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 return -1;
             }
         }
-        /* Use the frame types from the first pass, if available */
-        int sliceType = (m_param->rc.bStatRead) ? m_rateControl->rateControlSliceType(inFrame->m_poc) : inputPic->sliceType;
-        /* In analysisSave mode, x265_analysis_data is allocated in inputPic and inFrame points to this */
-        /* Load analysis data before lookahead->addPicture, since sliceType has been decided */
+
+        int sliceType = (m_param->rc.bStatRead) ? m_rateControl->rateControlSliceType(inFrame->m_poc) : inputPic->sliceType;  // 确定 slice 类型：二pass读统计时由码率控制决定，否则用输入指定
+
+        // ============================================================
+        //  分析数据加载（analysisLoad）
+        // 进入条件：analysisLoad（从文件加载前一pass的分析数据）
+        // 读取分析文件覆盖 sliceType/POC/
+        // 场景切标志/VBV 预测数据，复用前一pass的编码决策
+        // ============================================================
         if (m_param->analysisLoad)
         {
-            /* reads analysis data for the frame and allocates memory based on slicetype */
             static int paramBytes = CONF_OFFSET_BYTES;
             if (!inFrame->m_poc && m_param->bAnalysisType != HEVC_INFO)
             {
@@ -1725,7 +1768,6 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             {
                 cuLocation cuLocInFrame;
                 cuLocInFrame.init(m_param);
-                /* Set skipWidth/skipHeight flags when the out of bound pixels in lowRes is greater than half of maxCUSize */
                 int extendedWidth = ((m_param->sourceWidth / 2 + m_param->maxCUSize - 1) >> m_param->maxLog2CUSize) * m_param->maxCUSize;
                 int extendedHeight = ((m_param->sourceHeight / 2 + m_param->maxCUSize - 1) >> m_param->maxLog2CUSize) * m_param->maxCUSize;
                 uint32_t outOfBoundaryLowres = extendedWidth - m_param->sourceWidth / 2;
@@ -1742,6 +1784,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             sliceType = inFrame->m_analysisData.sliceType;
             inFrame->m_lowres.bScenecut = !!inFrame->m_analysisData.bScenecut;
             inFrame->m_lowres.satdCost = inFrame->m_analysisData.satdCost;
+            //  禁用 lookahead + analysisLoad：从分析数据恢复 lookahead 决策与 VBV 数据
             if (m_param->bDisableLookahead)
             {
                 inFrame->m_lowres.sliceType = sliceType;
@@ -1758,6 +1801,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 }
             }
         }
+
+        // ============================================================
+        //  码率控制统计恢复
+        // 进入条件：bUseRcStats 且输入携带 rcData（普通连续编码不开启）
+        // 从 rcData 恢复之前编码得到的码率控制器的累积 QP/QScale/缓冲区/预测器等状态
+        // ============================================================
         if (m_param->bUseRcStats && inputPic->rcData)
         {
             RcStats* rc = (RcStats*)inputPic->rcData;
@@ -1784,6 +1833,8 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             }
             m_param->bUseRcStats = 0;
         }
+
+        // 【不重要】帧复制模式：缓冲槽位滚动（tripling 后清空，否则 buf1 拷回 buf0）
         if (m_param->bEnableFrameDuplication && ((read < written) || (m_dupBuffer[0]->dupPic->picStruct == tripling && (read <= written))))
         {
             if (m_dupBuffer[0]->dupPic->picStruct == tripling)
@@ -1794,61 +1845,71 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 m_dupBuffer[1]->bOccupied = false;
             }
         }
+
+        // 【不重要】码率控制重配标志传递给帧
         if (m_reconfigureRc)
             inFrame->m_reconfigureRc = true;
-        m_lookahead->addPicture(*inFrame, sliceType);
-        m_numDelayedPic++;
+
+        m_lookahead->addPicture(*inFrame, sliceType);  // 将帧加入 lookahead 输入队列（后续由 lookahead 决策 slice 类型和 GOP 结构）
+        m_numDelayedPic++;                           // 延迟帧计数 +1
     }
-    else if (m_latestParam->forceFlush == 2) // forceFlush==2
+    else if (m_latestParam->forceFlush == 2)        // 无新输入时：forceFlush==2 时标记 lookahead 已满，后面检测这个标记就可以输出帧到编码器
         m_lookahead->m_filled = true;
     else
-        m_lookahead->flush();
-    FrameEncoder *curEncoder = m_frameEncoder[m_curEncoder];
-    m_curEncoder = (m_curEncoder + 1) % m_param->frameNumThreads;
-    int ret = 0;
-    /* Normal operation is to wait for the current frame encoder to complete its current frame
-     * and then to give it a new frame to work on.  In zero-latency mode, we must encode this
-     * input picture before returning so the order must be reversed. This do/while() loop allows
-     * us to alternate the order of the calls without ugly code replication */
-    Frame* outFrame = NULL;
-    Frame* frameEnc = NULL;
-    int pass = 0;
+        m_lookahead->flush();                       // 输入结束，刷新 lookahead（触发剩余帧决策输出）
+    FrameEncoder *curEncoder = m_frameEncoder[m_curEncoder];  // 取当前轮到的帧编码线程
+    m_curEncoder = (m_curEncoder + 1) % m_param->frameNumThreads;  // 轮转到下一个帧编码线程（实现流水线并行）
+    int ret = 0;                                // 返回值，0=无输出，1=有输出，-1=错误
+
+
+    Frame* outFrame = NULL;                     // 等下从编码器取出的已编码器帧容器
+    Frame* frameEnc = NULL;                     // 从 lookahead 决策队列取出的待编码帧容器
+    int pass = 0;                               // 零延迟模式的循环轮次。0延迟循环2次（第一次开始本帧编码，第二次取上一已编码帧），普通模式只循环一次（取上一已编码帧后返开始编码本帧）。
     do
     {
         /* getEncodedPicture() should block until the FrameEncoder has completed
          * encoding the frame.  This is how back-pressure through the API is
          * accomplished when the encoder is full */
-        if (!m_bZeroLatency || pass)
-            outFrame = curEncoder->getEncodedPicture(m_nalList);
+        if (!m_bZeroLatency || pass)            // 零延迟模式且pass=0（第一次循环），有限开始本帧编码所以不取已编码帧
+            outFrame = curEncoder->getEncodedPicture(m_nalList);    //阻塞等待取帧（这就是0延迟模式不先取已编码帧的原因）
         if (outFrame)
         {
-            Slice *slice = outFrame->m_encData->m_slice;
-            x265_frame_stats* frameData = NULL;
-            /* Free up inputPic->analysisData since it has already been used */
+            Slice *slice = outFrame->m_encData->m_slice;  // 取出输出帧的 slice
+            x265_frame_stats* frameData = NULL;            // 帧统计输出指针
+
+            // 【不重要】释放 analysisLoad 但不 save 时的分析数据（资源管理）
             if ((m_param->analysisLoad && !m_param->analysisSave) || ((m_param->bAnalysisType == AVC_INFO) && slice->m_sliceType != I_SLICE))
                 x265_free_analysis_data(m_param, &outFrame->m_analysisData);
+
+            // ---------- 输出图像填充 pic_out ----------
             if (pic_out)
             {
-                PicYuv *recpic = outFrame->m_reconPic;
-                pic_out->poc = slice->m_poc;
-                pic_out->bitDepth = X265_DEPTH;
-                pic_out->userData = outFrame->m_userData;
-                pic_out->colorSpace = m_param->internalCsp;
-                frameData = &(pic_out->frameData);
-                pic_out->pts = outFrame->m_pts;
-                pic_out->dts = outFrame->m_dts;
-                pic_out->reorderedPts = outFrame->m_reorderedPts;
-                pic_out->sliceType = outFrame->m_lowres.sliceType;
-                pic_out->planes[0] = recpic->m_picOrg[0];
-                pic_out->stride[0] = (int)(recpic->m_stride * sizeof(pixel));
-                if (m_param->internalCsp != X265_CSP_I400)
+                PicYuv *recpic = outFrame->m_reconPic;     // 重建图像（编码后解码得到的图像）
+                pic_out->poc = slice->m_poc;               // 输出 POC
+                pic_out->bitDepth = X265_DEPTH;            // 输出位深（编码器内部位深）
+                pic_out->userData = outFrame->m_userData;  // 回传用户数据
+                pic_out->colorSpace = m_param->internalCsp;// 输出色彩空间
+                frameData = &(pic_out->frameData);         // 帧统计输出指针
+                pic_out->pts = outFrame->m_pts;            // 显示时间戳
+                pic_out->dts = outFrame->m_dts;            // 解码时间戳
+                pic_out->reorderedPts = outFrame->m_reorderedPts;  // 重排序 PTS（编码顺序→显示顺序）
+                pic_out->sliceType = outFrame->m_lowres.sliceType; // slice 类型（I/P/B）
+                pic_out->planes[0] = recpic->m_picOrg[0];  // Y 平面像素指针
+                pic_out->stride[0] = (int)(recpic->m_stride * sizeof(pixel));  // Y 平面 stride（字节）
+                if (m_param->internalCsp != X265_CSP_I400) // 非单色时填充 U/V 平面
                 {
                     pic_out->planes[1] = recpic->m_picOrg[1];
                     pic_out->stride[1] = (int)(recpic->m_strideC * sizeof(pixel));
                     pic_out->planes[2] = recpic->m_picOrg[2];
                     pic_out->stride[2] = (int)(recpic->m_strideC * sizeof(pixel));
                 }
-                /* Dump analysis data from pic_out to file in save mode and free */
+
+                // ============================================================
+                //  分析数据保存（analysisSave）写入文件
+                // 进入条件：analysisSave 且有 pic_out
+                // 将本帧场景切/直方图/SATD/
+                // inter/intra 分析数据/VBV 预测数据写入文件供后续 pass 复用
+                // ============================================================
                 if (m_param->analysisSave)
                 {
                     pic_out->analysisData.poc = pic_out->poc;
@@ -1873,6 +1934,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     pic_out->analysisData.distortionData = outFrame->m_analysisData.distortionData;
                     pic_out->analysisData.modeFlag[0] = outFrame->m_analysisData.modeFlag[0];
                     pic_out->analysisData.modeFlag[1] = outFrame->m_analysisData.modeFlag[1];
+                    //  禁用 lookahead + analysisSave：额外保存 lookahead 决策与 VBV 行/CU 代价
                     if (m_param->bDisableLookahead)
                     {
                         int factor = 1;
@@ -1914,6 +1976,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                         x265_free_analysis_data(m_param, &pic_out->analysisData);
                 }
             }
+
+            // ============================================================
+            //  多pass细化/失真分析数据写入
+            // 进入条件：bStatWrite 且 (analysisMultiPassRefine 或 analysisMultiPassDistortion)
+            // 正常编码不会走，仅多pass细化模式：把 inter/intra/distortion 分析数据写入文件
+            // ============================================================
             if (m_param->rc.bStatWrite && (m_param->analysisMultiPassRefine || m_param->analysisMultiPassDistortion))
             {
                 if (pic_out)
@@ -1925,8 +1993,11 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 }
                 writeAnalysisFileRefine(&outFrame->m_analysisData, *outFrame->m_encData);
             }
+            // 【不重要】多pass细化后释放分析数据（资源管理）
             if (m_param->analysisMultiPassRefine || m_param->analysisMultiPassDistortion)
                 x265_free_analysis_data(m_param, &outFrame->m_analysisData);
+
+            // 【不重要】加权预测帧统计——统计使用 luma/chroma 加权预测的 P/B 帧数量（供头信息决策，统计辅助）
             if (m_param->internalCsp == X265_CSP_I400)
             {
                 if (slice->m_sliceType == P_SLICE)
@@ -1973,10 +2044,15 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                         m_numChromaWPBiFrames++;
                 }
             }
-            if (m_aborted)
+
+            if (m_aborted)                         // 编码中止检查
                 return -1;
+
+            // 【不重要】达到 chunkStart 后收集帧统计（统计辅助）
             if ((m_outputCount + 1)  >= m_param->chunkStart)
                 finishFrameStats(outFrame, curEncoder, frameData, m_pocLast);
+
+            // 【不重要】analysisSave 时补充输出帧位/参考列表/intra 占比等统计
             if (m_param->analysisSave)
             {
                 pic_out->analysisData.frameBits = frameData->bits;
@@ -1999,13 +2075,15 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     }
                 }
             }
-            /* Write RateControl Frame level stats in multipass encodes */
+
+            // 【不重要】多pass码率控制帧级统计写入
             if (m_param->rc.bStatWrite)
                 if (m_rateControl->writeRateControlFrameStats(outFrame, &curEncoder->m_rce))
                     m_aborted = true;
+
+            // 【不重要】输出帧的码率控制数据回填到 rcData（供外部或分块编码复用码率状态）
             if (pic_out)
             {
-                /* m_rcData is allocated for every frame */
                 pic_out->rcData = outFrame->m_rcData;
                 outFrame->m_rcData->qpaRc = outFrame->m_encData->m_avgQpRc;
                 outFrame->m_rcData->qRceq = curEncoder->m_rce.qRceq;
@@ -2023,7 +2101,8 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 outFrame->m_rcData->pCuCount = outFrame->m_encData->m_frameStats.percent8x8Inter * m_rateControl->m_ncu;
                 outFrame->m_rcData->skipCuCount = outFrame->m_encData->m_frameStats.percent8x8Skip  * m_rateControl->m_ncu;
             }
-            /* Allow this frame to be recycled if no frame encoders are using it for reference */
+
+            // 【不重要】输出帧引用计数管理（资源管理）：无 pic_out 时立即释放，否则导出给调用方
             if (!pic_out)
             {
                 ATOMIC_DEC(&outFrame->m_countRefEncoders);
@@ -2031,19 +2110,27 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             }
             else
                 m_exportedPic = outFrame;
-            m_outputCount++;
-            if (m_param->chunkEnd == m_outputCount)
-                m_numDelayedPic = 0;
+
+            m_outputCount++;                        // 已输出帧计数 +1
+            if (m_param->chunkEnd == m_outputCount)  // 到达 chunkEnd
+                m_numDelayedPic = 0;                // 清空延迟计数
             else
-                m_numDelayedPic--;
-            ret = 1;
+                m_numDelayedPic--;                  // 延迟帧 -1
+            ret = 1;                                // 标记本次有输出
         }
+
         /* pop a single frame from decided list, then provide to frame encoder
          * curEncoder is guaranteed to be idle at this point */
-        if (!pass)
+        if (!pass)                                  // 仅 pass 0 取新帧（零延迟 pass 1 复用本帧）
             frameEnc = m_lookahead->getDecidedPicture();
-        if (frameEnc && !pass && (!m_param->chunkEnd || (m_encodedFrameNum < m_param->chunkEnd)))
+
+        if (frameEnc && !pass && (!m_param->chunkEnd || (m_encodedFrameNum < m_param->chunkEnd)))  // 有 frameEnc 且 pass 0 且未到 chunkEnd
         {
+            // ============================================================
+            //  场景切感知 QP 的窗口更新
+            // 进入条件：bEnableSceneCutAwareQp 且 bStatRead
+            // 正常编码不会走，仅二pass场景切感知 QP 模式：维护最近场景切 POC 判断窗口超时
+            // ============================================================
             if (m_param->bEnableSceneCutAwareQp && m_param->rc.bStatRead)
             {
                 RateControlEntry * rcEntry;
@@ -2060,6 +2147,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     }
                 }
             }
+
+            // ============================================================
+            //  多pass细化：为本帧分配并读取分析数据
+            // 进入条件：analysisMultiPassRefine 或 analysisMultiPassDistortion
+            // 正常编码不会走，仅多pass细化模式：分配分析数据并从文件读上一pass决策
+            // ============================================================
             if (m_param->analysisMultiPassRefine || m_param->analysisMultiPassDistortion)
             {
                 uint32_t widthInCU = (m_param->sourceWidth + m_param->maxCUSize - 1) >> m_param->maxLog2CUSize;
@@ -2071,6 +2164,11 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 if (m_param->rc.bStatRead)
                     readAnalysisFile(&frameEnc->m_analysisData, frameEnc->m_poc, frameEnc->m_lowres.sliceType);
             }
+
+            // ============================================================
+            //  区域配置重置
+            // 正常编码不会走，仅区域码率控制模式：到达 zone 起始帧时触发参数重配
+            // ============================================================
             if (m_param->bResetZoneConfig)
             {
                 for (int i = 0; i < m_param->rc.zonefileCount; i++)
@@ -2079,6 +2177,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                         x265_encoder_reconfig(this, m_param->rc.zones[i].zoneParam);
                 }
             }
+
+            // ============================================================
+            //  运行时参数重配处理
+            // 正常编码不会走，仅调用 reconfig API 后：码率控制重配 + 一轮 FE 完成后把
+            // m_latestParam 拷回 m_param 完成 encoder 重配
+            // ============================================================
             if (frameEnc->m_reconfigureRc && m_reconfigureRc)
             {
                 x265_copy_params(m_param, m_latestParam);
@@ -2097,27 +2201,31 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 m_reconfigure = false;
             }
             /* Initiate reconfigure for this FE if necessary */
-            curEncoder->m_param = m_reconfigure ? m_latestParam : m_param;
-            curEncoder->m_reconfigure = m_reconfigure;
-            /* give this frame a FrameData instance before encoding */
+            curEncoder->m_param = m_reconfigure ? m_latestParam : m_param;  
+            curEncoder->m_reconfigure = m_reconfigure;                    
+
+            // ---------- 为待编码帧分配 FrameData（编码数据结构） ----------
             if (m_dpb->m_frameDataFreeList)
             {
-                frameEnc->m_encData = m_dpb->m_frameDataFreeList;
+                frameEnc->m_encData = m_dpb->m_frameDataFreeList;            // 复用空闲 FrameData
                 m_dpb->m_frameDataFreeList = m_dpb->m_frameDataFreeList->m_freeListNext;
-                frameEnc->reinit(m_sps);
+                frameEnc->reinit(m_sps);                                     // 用当前 SPS 重新初始化
                 frameEnc->m_param = m_reconfigure ? m_latestParam : m_param;
                 frameEnc->m_encData->m_param = m_reconfigure ? m_latestParam : m_param;
             }
             else
             {
+                // 无空闲 FrameData 时新建
                 frameEnc->allocEncodeData(m_reconfigure ? m_latestParam : m_param, m_sps);
                 Slice* slice = frameEnc->m_encData->m_slice;
-                slice->m_sps = &m_sps;
-                slice->m_pps = &m_pps;
-                slice->m_param = m_param;
-                slice->m_maxNumMergeCand = m_param->maxNumMergeCand;
-                slice->m_endCUAddr = slice->realEndAddress(m_sps.numCUsInFrame * m_param->num4x4Partitions);
+                slice->m_sps = &m_sps;                                       // slice 绑定 SPS
+                slice->m_pps = &m_pps;                                       // slice 绑定 PPS
+                slice->m_param = m_param;                                    // slice 绑定参数
+                slice->m_maxNumMergeCand = m_param->maxNumMergeCand;         // 最大 merge 候选数
+                slice->m_endCUAddr = slice->realEndAddress(m_sps.numCUsInFrame * m_param->num4x4Partitions);  // slice 最后一个 CU 地址
             }
+
+            //  analysisLoad + 禁用 lookahead：从分析数据恢复 dts/reorderedPts 与 VBV 行/CU 代价
             if (m_param->analysisLoad && m_param->bDisableLookahead)
             {
                 frameEnc->m_dts = frameEnc->m_analysisData.lookahead.dts;
@@ -2136,6 +2244,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     }
                 }
             }
+
+            // ============================================================
+            //  SEA 运动估计积分图缓冲分配
+            // 进入条件：searchMethod == X265_SEA 且非 B 帧
+            // 正常编码不会走，仅选择 SEA 运动搜索算法时：为积分图分配缓冲
+            // ============================================================
             if (m_param->searchMethod == X265_SEA && frameEnc->m_lowres.sliceType != X265_TYPE_B)
             {
                 int padX = m_param->maxCUSize + 32;
@@ -2154,6 +2268,12 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                         x265_log(m_param, X265_LOG_ERROR, "SEA motion search: POC %d Integral buffer[%d] unallocated\n", frameEnc->m_poc, i);
                 }
             }
+
+            // ============================================================
+            //  PPS QP 优化
+            // 进入条件：bOptQpPPS 且当前为关键帧 且 bRepeatHeaders
+            // 正常编码不会走，仅开启 PPS QP 优化时：统计历史各 QP 比特代价，选最小代价 QP 更新 PPS 偏移
+            // ============================================================
             if (m_param->bOptQpPPS && frameEnc->m_lowres.bKeyframe && m_param->bRepeatHeaders)
             {
                 ScopedLock qpLock(m_sliceQpLock);
@@ -2179,14 +2299,18 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 for (int i = 0; i < QP_MAX_MAX + 1; i++)
                     m_iBitsCostSum[i] = 0;
             }
-            frameEnc->m_encData->m_slice->m_iPPSQpMinus26 = m_iPPSQpMinus26;
-            frameEnc->m_encData->m_slice->numRefIdxDefault[0] = m_pps.numRefIdxDefault[0];
-            frameEnc->m_encData->m_slice->numRefIdxDefault[1] = m_pps.numRefIdxDefault[1];
-            frameEnc->m_encData->m_slice->m_iNumRPSInSPS = m_sps.spsrpsNum;
-            curEncoder->m_rce.encodeOrder = frameEnc->m_encodeOrder = m_encodedFrameNum++;
+
+            // ----------  把 slice 级参数写入帧编码数据 ----------
+            frameEnc->m_encData->m_slice->m_iPPSQpMinus26 = m_iPPSQpMinus26;            // PPS QP 偏移（QP=26+该值）
+            frameEnc->m_encData->m_slice->numRefIdxDefault[0] = m_pps.numRefIdxDefault[0];  // PPS 默认 L0 参考帧数
+            frameEnc->m_encData->m_slice->numRefIdxDefault[1] = m_pps.numRefIdxDefault[1];  // PPS 默认 L1 参考帧数
+            frameEnc->m_encData->m_slice->m_iNumRPSInSPS = m_sps.spsrpsNum;             // SPS 中参考图像集(RPS)数量
+            curEncoder->m_rce.encodeOrder = frameEnc->m_encodeOrder = m_encodedFrameNum++;  // 分配编码序号（编码顺序号，区别于 POC）
+
+            // ----------  DTS 计算 ----------
             if (!m_param->analysisLoad || !m_param->bDisableLookahead)
             {
-                if (m_bframeDelay)
+                if (m_bframeDelay)                     // 有 B 帧延迟时用环形缓冲计算 DTS
                 {
                     int64_t *prevReorderedPts = m_prevReorderedPts;
                     frameEnc->m_dts = m_encodedFrameNum > m_bframeDelay
@@ -2195,9 +2319,10 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     prevReorderedPts[m_encodedFrameNum % m_bframeDelay] = frameEnc->m_reorderedPts;
                 }
                 else
-                    frameEnc->m_dts = frameEnc->m_reorderedPts;
+                    frameEnc->m_dts = frameEnc->m_reorderedPts;  // 无 B 帧延迟，DTS=重排序 PTS
             }
-            /* Allocate analysis data before encode in save mode. This is allocated in frameEnc */
+
+            // 【不重要】analysisSave 且非 analysisLoad：为本帧分配分析数据结构（资源准备）
             if (m_param->analysisSave && !m_param->analysisLoad)
             {
                 x265_analysis_data* analysis = &frameEnc->m_analysisData;
@@ -2211,8 +2336,11 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                 analysis->numPartitions  = m_param->num4x4Partitions;
                 x265_alloc_analysis_data(m_param, analysis);
             }
+
             /* determine references, setup RPS, etc */
-            m_dpb->prepareEncode(frameEnc);
+            m_dpb->prepareEncode(frameEnc);  // DPB 准备编码——确定参考帧、设置 RPS（参考图像集）、初始化参考列表等
+
+            // 【不重要】选择性 SAO——按模式跳过某些帧的 SAO 以加速（性能优化）
             if (!!m_param->selectiveSAO)
             {
                 Slice* slice = frameEnc->m_encData->m_slice;
@@ -2232,22 +2360,32 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             }
             else
             {
+                // 未启用 selectiveSAO 时直接关闭 SAO
                 Slice* slice = frameEnc->m_encData->m_slice;
                 slice->m_bUseSao = curEncoder->m_frameFilter.m_useSao = 0;
             }
+
+            //  非 CQP 模式时由 lookahead 估计本帧代价（用于码率控制 QP 计算）
             if (m_param->rc.rateControlMode != X265_RC_CQP)
                 m_lookahead->getEstimatedPictureCost(frameEnc);
+
+            // ============================================================
+            //  帧内刷新
+            // 进入条件：bIntraRefresh
+            // 正常编码不会走，仅开启帧内刷新（替代 IDR 的流式抗误码模式）时：计算刷新间隔
+            // ============================================================
             if (m_param->bIntraRefresh)
                  calcRefreshInterval(frameEnc);
+
             /* Allow FrameEncoder::compressFrame() to start in the frame encoder thread */
-            if (!curEncoder->startCompressFrame(frameEnc))
+            if (!curEncoder->startCompressFrame(frameEnc))  // 启动帧编码线程的压缩任务（异步执行 compressFrame）。失败则置中止
                 m_aborted = true;
         }
-        else if (m_encodedFrameNum)
-            m_rateControl->setFinalFrameCount(m_encodedFrameNum);
+        else if (m_encodedFrameNum)                    // 无新帧可投但已编码过
+            m_rateControl->setFinalFrameCount(m_encodedFrameNum);  // 通知码率控制最终帧数
     }
-    while (m_bZeroLatency && ++pass < 2);
-    return ret;
+    while (m_bZeroLatency && ++pass < 2);              // 零延迟模式循环两次（pass 0 投递+pass 1 取回），否则一次
+    return ret;                                        // 返回 0(无输出)/1(有输出)/-1(错误)
 }
 int Encoder::reconfigureParam(x265_param* encParam, x265_param* param)
 {
