@@ -289,7 +289,7 @@ void FrameEncoder::threadMain()
         /* the first FE on each NUMA node is responsible for allocating thread
          * local data for all worker threads in that pool. If WPP is disabled, then
          * each FE also needs a TLD instance */
-        if (!m_jpId) // 旁路:仅 jpId==0 的首个 FE 负责为本池所有 worker 分配 TLD,主线可跳过
+        if (!m_jpId) //    仅 jpId==0 的首个 FE 负责为本池所有 worker 分配 TLD  
         {
             int numTLD = m_pool->m_numWorkers;
             if (!m_param->bEnableWavefront) // 非 WPP 模式下 provider(FE)自身也需要一份 TLD
@@ -330,14 +330,14 @@ void FrameEncoder::threadMain()
 
     while (m_threadActive) // 事件驱动主循环:反复 压缩帧 -> 通知完成 -> 等待下一帧
     {
-        if (m_param->bCTUInfo) // 旁路:外部 CTU 信息复用,主线可跳过
+        if (m_param->bCTUInfo) //    外部 CTU 信息复用  
         {
             while (!m_frame->m_ctuInfo)
                 m_frame->m_copied.wait();
         }
         if ((m_param->bAnalysisType == AVC_INFO) && !m_param->analysisSave && !m_param->analysisLoad && !(IS_X265_TYPE_I(m_frame->m_lowres.sliceType)))
         {
-            // 旁路:AVC_INFO 复用模式等待分析数据,主线可跳过
+            //    AVC_INFO 复用模式等待分析数据  
             while (((m_frame->m_analysisData.interData == NULL && m_frame->m_analysisData.intraData == NULL) || (uint32_t)m_frame->m_poc != m_frame->m_analysisData.poc))
                 m_frame->m_copyMVType.wait();
         }
@@ -427,10 +427,18 @@ void FrameEncoder::writeTrailingSEIMessages()
 
 void FrameEncoder::compressFrame()
 {
+    /*
+     *   1. rateControlStart() 取得本帧 QP；
+     *   2. 初始化 slice、熵编码器、CTU 行和子码流；
+     *   3. 调度 processRowEncoder()，完成 CTU 分析、重建和环路滤波；
+     *   4. 写 slice header，并把各行子码流封装进 m_nalList；
+     *   5. rateControlEnd() 收尾，并释放参考帧。
+     */
     ProfileScopeEvent(frameThread); // 性能采样事件
 
-    m_startCompressTime = x265_mdate(); // 记录压缩起始时间戳
-    m_totalActiveWorkerCount = 0; // 重置 worker 统计计数器
+    // 【不重要】性能、线程利用率、质量统计以及 VBV 行重编码状态的清零。
+    m_startCompressTime = x265_mdate(); 
+    m_totalActiveWorkerCount = 0; 
     m_activeWorkerCountSamples = 0;
     m_totalWorkerElapsedTime = 0;
     m_totalNoWorkerTime = 0;
@@ -438,20 +446,21 @@ void FrameEncoder::compressFrame()
     m_allRowsAvailableTime = 0;
     m_stallStartTime = 0;
 
-    m_completionCount = 0; // 重置完成计数(用于触发完成事件)
-    m_bAllRowsStop = false; // VBV 重置时的全行停止标志
-    m_vbvResetTriggerRow = -1; // 触发 VBV 重置的行号,-1 表示无
+    m_completionCount = 0; 
+    m_bAllRowsStop = false; 
+    m_vbvResetTriggerRow = -1; 
     m_rowSliceTotalBits[0] = 0;
     m_rowSliceTotalBits[1] = 0;
 
-    m_SSDY = m_SSDU = m_SSDV = 0; // 重置 SSD/SSIM 统计
+    m_SSDY = m_SSDU = m_SSDV = 0; 
     m_ssim = 0;
     m_ssimCnt = 0;
     memset(&(m_frame->m_encData->m_frameStats), 0, sizeof(m_frame->m_encData->m_frameStats));
 
+    // 【不重要】为基于边缘的递归跳过预先生成边缘图。
+    /*编码器先生成一张边缘特征图（轮廓图）；如果CU中区域边缘变化较少，就认为继续拆成小 CU收益可能不大，于是提前停止四叉树递归，以加快编*/
     if (!m_param->bHistBasedSceneCut && m_param->rc.aqMode != X265_AQ_EDGE && m_param->recursionSkipMode == EDGE_BASED_RSKIP)
     {
-        // 旁路:边缘计算用于 sceneCut/AQ/递归跳过,主线可跳过
         int height = m_frame->m_fencPic->m_picHeight;
         int width = m_frame->m_fencPic->m_picWidth;
         intptr_t stride = m_frame->m_fencPic->m_stride;
@@ -467,9 +476,10 @@ void FrameEncoder::compressFrame()
      * unit) */
     Slice* slice = m_frame->m_encData->m_slice;
 
+    // 【不重要】按配置写 AUD，用来标识一个 Access Unit 的开始。
+    /*Access Unit 是 HEVC 标准规定的码流逻辑结构，每个AU包含多个NALU，AUD是一个 AU 的第一个NALU*/
     if (m_param->bEnableAccessUnitDelimiters && (m_frame->m_poc || m_param->bRepeatHeaders))
     {
-        // 旁路:写 AUD(访问单元分隔符)NAL,主线可跳过
         m_bs.resetBits();
         m_entropyCoder.setBitstream(&m_bs);
         m_entropyCoder.codeAUD(*slice);
@@ -478,9 +488,9 @@ void FrameEncoder::compressFrame()
         if (m_param->bSingleSeiNal)
             m_bs.resetBits();
     }
+    // 【不重要】关键帧重复输出 VPS/SPS/PPS，便于从关键帧独立开始解码。
     if (m_frame->m_lowres.bKeyframe && m_param->bRepeatHeaders)
     {
-        // 旁路:关键帧重复写 SPS/PPS 头,主线可跳过
         if (m_param->bOptRefListLengthPPS)
         {
             ScopedLock refIdxLock(m_top->m_sliceRefIdxLock);
@@ -503,13 +513,13 @@ void FrameEncoder::compressFrame()
     if (m_top->m_param->rc.bStatRead && m_top->m_param->bMultiPassOptRPS)
         m_frame->m_encData->m_slice->m_rpsIdx = (m_top->m_rateControl->m_rce2Pass + m_frame->m_encodeOrder)->rpsIdx;
 
-    // 加权预测参数估计(P/B slice 才需要)
+    // 为 P/B 帧准备加权预测参数和参考图像。
     bool bUseWeightP = slice->m_sliceType == P_SLICE && slice->m_pps->bUseWeightPred; // P slice 加权预测开关
     bool bUseWeightB = slice->m_sliceType == B_SLICE && slice->m_pps->bUseWeightedBiPred; // B slice 加权预测开关
 
     WeightParam* reuseWP = NULL;
     if (m_param->analysisLoad && (bUseWeightP || bUseWeightB))
-        reuseWP = (WeightParam*)m_frame->m_analysisData.wt; // 旁路:从分析文件复用权重,主线可跳过
+        reuseWP = (WeightParam*)m_frame->m_analysisData.wt; // 从分析文件复用权重
 
     if (bUseWeightP || bUseWeightB)
     {
@@ -519,7 +529,7 @@ void FrameEncoder::compressFrame()
 #endif
         if (m_param->analysisLoad)
         {
-            // 旁路:analysisLoad 复用权重表,主线可跳过
+            // analysisLoad 复用权重表
             for (int list = 0; list < slice->isInterB() + 1; list++) 
             {
                 for (int plane = 0; plane < (m_param->internalCsp != X265_CSP_I400 ? 3 : 1); plane++)
@@ -532,7 +542,7 @@ void FrameEncoder::compressFrame()
         }
         else
         {
-            // 主线:加权预测分析。优先借用空闲 worker,否则本线程内做
+            // 加权预测分析。优先借用空闲 worker,否则本线程内做
             WeightAnalysis wa(*this);
             if (m_pool && wa.tryBondPeers(*this, 1))
                 /* use an idle worker for weight analysis */
@@ -560,25 +570,26 @@ void FrameEncoder::compressFrame()
         }
         if (m_param->analysisSave && (bUseWeightP || bUseWeightB))
         {
-            // 旁路:analysisSave 保存权重表,主线可跳过
+            // analysisSave 保存权重表
             for (int i = 0; i < (m_param->internalCsp != X265_CSP_I400 ? 3 : 1); i++)
                 *(reuseWP++) = slice->m_weightPredTable[l][0][i];
         }
 
     }
 
+    //统计有多少个线程局部数据
     int numTLD;
     if (m_pool)
         numTLD = m_param->bEnableWavefront ? m_pool->m_numWorkers : m_pool->m_numWorkers + m_pool->m_numProviders;
     else
         numTLD = 1;
 
-    /* Get the QP for this frame from rate control. This call may block until
-     * frames ahead of it in encode order have called rateControlEnd() */
-    int qp = m_top->m_rateControl->rateControlStart(m_frame, &m_rce, m_top); // 主线:从码率控制取本帧 QP(可能阻塞等待前序帧)
+    // 【确定本帧 QP】码率控制在这里正式参与当前帧编码。
+    int qp = m_top->m_rateControl->rateControlStart(m_frame, &m_rce, m_top); // 从码率控制取本帧 QP(可能阻塞等待前序帧)
     m_rce.newQp = qp;
 
-    if (m_nr) // 旁路:噪声抑制(NR)相关偏移设置,主线可跳过
+    // 【不重要】噪声抑制参数下发给各个线程的量化器。
+    if (m_nr) // 噪声抑制(NR)相关偏移设置
     {
         if (qp > QP_MAX_SPEC && m_frame->m_param->rc.vbvBufferSize)
         {
@@ -608,17 +619,17 @@ void FrameEncoder::compressFrame()
         }
     }
 
-    /* Clip slice QP to 0-51 spec range before encoding */
     slice->m_sliceQp = x265_clip3(-QP_BD_OFFSET, QP_MAX_SPEC, qp); // 限定 slice QP 到合规范围
-    if (m_param->bHDR10Opt) // 旁路:HDR10 色度 QP 偏移,主线可跳过
+    // 【不重要】HDR10 模式下额外调整色度 QP。
+    if (m_param->bHDR10Opt)
     {
         int qpCb = x265_clip3(-12, 0, (int)floor((m_top->m_cB * ((-.46) * qp + 9.26)) + 0.5 ));
         int qpCr = x265_clip3(-12, 0, (int)floor((m_top->m_cR * ((-.46) * qp + 9.26)) + 0.5 ));
         slice->m_chromaQpOffset[0] = slice->m_pps->chromaQpOffset[0] + qpCb < -12 ? (qpCb + (-12 - (slice->m_pps->chromaQpOffset[0] + qpCb))) : qpCb;
         slice->m_chromaQpOffset[1] = slice->m_pps->chromaQpOffset[1] + qpCr < -12 ? (qpCr + (-12 - (slice->m_pps->chromaQpOffset[1] + qpCr))) : qpCr;
     }
-
-    if (m_param->bOptQpPPS && m_param->bRepeatHeaders) // 旁路:QP PPS 优化统计,主线可跳过
+    // 【不重要】QP PPS 优化统计
+    if (m_param->bOptQpPPS && m_param->bRepeatHeaders) 
     {
         ScopedLock qpLock(m_top->m_sliceQpLock);
         for (int i = 0; i < (QP_MAX_MAX + 1); i++)
@@ -629,16 +640,17 @@ void FrameEncoder::compressFrame()
         }
         m_top->m_iFrameNum++;
     }
+    // 【初始化编码环境】建立 slice 初始 CABAC 上下文、滤波器、CTU 行状态和输出子码流。
     m_initSliceContext.resetEntropy(*slice); // 重置初始 slice 上下文的熵编码器
 
-    m_frameFilter.start(m_frame, m_initSliceContext);
+    m_frameFilter.start(m_frame, m_initSliceContext);//为当前帧的环路滤波流程做初始化/重置
 
     /* ensure all rows are blocked prior to initializing row CTU counters */
     WaveFront::clearEnabledRowMask(); // 清除行启用位图,确保初始化期间无行可执行
 
     /* reset entropy coders and compute slice id */
     m_entropyCoder.load(m_initSliceContext); // 熵编码器加载初始 slice 上下文
-    for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)   
+    for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)   //遍历slice的所有行（x265 多 slice 实现限制每个 slice 必须由完整的 CTU 行组成。）
         for (uint32_t row = m_sliceBaseRow[sliceId]; row < m_sliceBaseRow[sliceId + 1]; row++)
             m_rows[row].init(m_initSliceContext, sliceId); // 初始化每一行的状态(entropy 上下文、sliceId 等)
 
@@ -646,37 +658,37 @@ void FrameEncoder::compressFrame()
     m_sliceCnt = 0;
 
     uint32_t numSubstreams = m_param->bEnableWavefront ? slice->m_sps->numCuInHeight : m_param->maxSlices; // WPP:每行一个子流,否则每个 slice 一个
-    X265_CHECK(m_param->bEnableWavefront || (m_param->maxSlices == 1), "Multiple slices without WPP unsupport now!");
+    X265_CHECK(m_param->bEnableWavefront || (m_param->maxSlices == 1), "Multiple slices without WPP unsupport now!");//不支持串行处理多slice
     if (!m_outStreams)
     {
-        m_outStreams = new Bitstream[numSubstreams]; // 分配每子流的比特流缓冲
+        m_outStreams = new Bitstream[numSubstreams]; // m_outStreams 保存当前帧中各个 CTU 行产生的 CABAC slice-data 子流，serializeSubstreams() 会把它们拼接起来，并与 slice header 一起组成 slice NALU。
         if (!m_param->bEnableWavefront)
-            m_backupStreams = new Bitstream[numSubstreams]; // 非 WPP 下用于 VBV 重编码回滚
+            m_backupStreams = new Bitstream[numSubstreams]; // 非 WPP 下用于 VBV 重编码回滚（如果上一行编码bit过大，那么要调大QP重新编码该行，重新编码前需要备份之前已编码的比特流）
         m_substreamSizes = X265_MALLOC(uint32_t, numSubstreams);
-        if (!slice->m_bUseSao)
+        if (!slice->m_bUseSao)//无SAO
         {
             for (uint32_t i = 0; i < numSubstreams; i++)
-                m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]); // 无 SAO:rowCoder 直接写入输出流
+                m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]); // 这行是把第 i 个输出子流绑定给第 i 行的 CABAC 编码器
         }
     }
     else
-    {
+    {   //已经有子流（上一帧的），直接复用
         for (uint32_t i = 0; i < numSubstreams; i++)
         {
-            m_outStreams[i].resetBits();
+            m_outStreams[i].resetBits();//清空前一帧的子流数据
             if (!slice->m_bUseSao)
                 m_rows[i].rowGoOnCoder.setBitstream(&m_outStreams[i]);
             else
-                m_rows[i].rowGoOnCoder.setBitstream(NULL); // 有 SAO:延迟到 encodeSlice 阶段再写
+                m_rows[i].rowGoOnCoder.setBitstream(NULL); //启用SAO：暂时不绑定输出子流，CABAC 输出会延迟到后面的 encodeSlice() 阶段再绑定并写入
         }
     }
 
     m_rce.encodeOrder = m_frame->m_encodeOrder;
     int prevBPSEI = m_rce.encodeOrder ? m_top->m_lastBPSEI : 0;
 
+    // 【不重要】以下直到用户 SEI 结束，主要是在输出 HRD、恢复点、时序等辅助 SEI。
     if (m_frame->m_lowres.bKeyframe)
     {
-        // 旁路:关键帧的 buffering period / recovery point SEI,主线可跳过
         if (m_param->bEmitHRDSEI)
         {
             SEIBufferingPeriod* bpSei = &m_top->m_rateControl->m_bufPeriodSEI;
@@ -705,7 +717,7 @@ void FrameEncoder::compressFrame()
         }
     }
 
-    if ((m_param->bEmitHRDSEI || !!m_param->interlaceMode)) // 旁路:picture timing / interlace SEI,主线可跳过
+    if ((m_param->bEmitHRDSEI || !!m_param->interlaceMode)) // picture timing / interlace SEI,
     {
         SEIPictureTiming *sei = m_rce.picTimingSEI;
         const VUI *vui = &slice->m_sps->vuiParameters;
@@ -756,14 +768,14 @@ void FrameEncoder::compressFrame()
         sei->writeSEImessages(m_bs, *slice->m_sps, NAL_UNIT_PREFIX_SEI, m_nalList, m_param->bSingleSeiNal);
     }
 
-    if (m_param->preferredTransferCharacteristics > -1 && slice->isIRAP()) // 旁路:alternative transfer characteristics SEI,主线可跳过
+    if (m_param->preferredTransferCharacteristics > -1 && slice->isIRAP()) 
     {
         SEIAlternativeTC m_seiAlternativeTC;
         m_seiAlternativeTC.m_preferredTransferCharacteristics = m_param->preferredTransferCharacteristics;
         m_seiAlternativeTC.writeSEImessages(m_bs, *slice->m_sps, NAL_UNIT_PREFIX_SEI, m_nalList, m_param->bSingleSeiNal);
     }
 
-    /* Write user SEI */ // 旁路:用户自定义 SEI,主线可跳过
+    /* Write user SEI */
     for (int i = 0; i < m_frame->m_userSEI.numPayloads; i++)
     {
         x265_sei_payload *payload = &m_frame->m_userSEI.payloads[i];
@@ -798,35 +810,32 @@ void FrameEncoder::compressFrame()
         m_bs.writeByteAlignment();
         m_nalList.serialize(NAL_UNIT_PREFIX_SEI, m_bs);
     }
-    /* CQP and CRF (without capped VBV) doesn't use mid-frame statistics to 
-     * tune RateControl parameters for other frames.
-     * Hence, for these modes, update m_startEndOrder and unlock RC for previous threads waiting in
-     * RateControlEnd here, after the slice contexts are initialized. For the rest - ABR
-     * and VBV, unlock only after rateControlUpdateStats of this frame is called */
+    //CQP/无 VBV 的 CRF 不依赖帧间实时统计，所以这里提前解除码控顺序锁；第二次递增是启动阶段的流水线补偿。
     if (m_param->rc.rateControlMode != X265_RC_ABR && !m_top->m_rateControl->m_isVbv)
     {
-        // 主线:CQP/CRF(无 VBV)模式在此提前解锁码控顺序锁,放行前序帧的 rateControlEnd
+        // CQP/CRF(无 VBV)模式在此提前解锁码控顺序锁,放行前序帧的 rateControlEnd
         m_top->m_rateControl->m_startEndOrder.incr();
 
         if (m_rce.encodeOrder < m_param->frameNumThreads - 1)
             m_top->m_rateControl->m_startEndOrder.incr(); // faked rateControlEnd calls for negative frames
     }
 
-    if (m_param->bDynamicRefine) // 旁路:动态 refine 训练数据,主线可跳过
+    // 【不重要】动态 refine 的训练数据准备。
+    if (m_param->bDynamicRefine) 
         computeAvgTrainingData();
 
+    // 【压缩 CTU】全函数最核心的阶段
     /* Analyze CTU rows, most of the hard work is done here.  Frame is
      * compressed in a wave-front pattern if WPP is enabled. Row based loop
      * filters runs behind the CTU compression and reconstruction */
-
     for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)    
         m_rows[m_sliceBaseRow[sliceId]].active = true; // 激活每个 slice 的首行,作为波前起点
     
     if (m_param->bEnableWavefront)
     {
-        // 主线:WPP 模式下建立 行号 <-> 队列索引 的双向映射
+        // WPP 模式下建立 行号 <-> 队列索引 的双向映射
         int i = 0;
-        for (uint32_t rowInSlice = 0; rowInSlice < m_sliceGroupSize; rowInSlice++)
+        for (uint32_t rowInSlice = 0; rowInSlice < m_sliceGroupSize; rowInSlice++)//m_sliceGroupSize 表示单个 slice 所包含的最大 CTU 行数（x265的 slice 是均匀切分的）
         {
             for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)
             {
@@ -835,8 +844,8 @@ void FrameEncoder::compressFrame()
                 const uint32_t row = sliceStartRow + rowInSlice;
                 if (row > sliceEndRow)
                     continue;
-                m_row_to_idx[row] = i;
-                m_idx_to_row[i] = row;
+                m_row_to_idx[row] = i;//CTU 行号 -> wpp编码调度队列索引
+                m_idx_to_row[i] = row;//wpp编码调度队列索引 -> CTU 行号
                 i += 1;
             }
         }
@@ -844,7 +853,7 @@ void FrameEncoder::compressFrame()
 
     if (m_param->bEnableWavefront)
     {
-        // 主线:WPP 调度循环——逐行投递编码任务,等待参考帧重建行后唤醒 worker
+        // WPP 调度循环——逐行投递编码任务,等待参考帧重建行后唤醒 worker
         for (uint32_t rowInSlice = 0; rowInSlice < m_sliceGroupSize; rowInSlice++)
         {
             for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)
@@ -859,7 +868,8 @@ void FrameEncoder::compressFrame()
                     continue;
 
                 // block until all reference frames have reconstructed the rows we need
-                // 主线:行级同步——等待所有参考帧的对应重建行就绪
+                // 行级同步——等待所有参考帧的对应重建行就绪
+
                 for (int l = 0; l < numPredDir; l++)
                 {
                     for (int ref = 0; ref < slice->m_numRefIdx[l]; ref++)
@@ -877,32 +887,32 @@ void FrameEncoder::compressFrame()
                     }
                 }
 
-                enableRowEncoder(m_row_to_idx[row]); /* clear external dependency for this row */ // 清除该行外部依赖,允许被调度
+                enableRowEncoder(m_row_to_idx[row]); // 清除该行外部依赖,允许被调度
                 if (!rowInSlice)
                 {
                     m_row0WaitTime = x265_mdate();
-                    enqueueRowEncoder(m_row_to_idx[row]); /* clear internal dependency, start wavefront */ // 入队每个 slice 首行,启动波前
+                    enqueueRowEncoder(m_row_to_idx[row]); // 入队每个 slice 首行,启动波前
                 }
-                tryWakeOne(); // 唤醒一个睡眠 worker 处理就绪行
+                tryWakeOne(); // 唤醒一个睡眠 worker 处理就绪行（可能没有空闲worker或内部依赖不满足，不一定能够唤醒）
             } // end of loop rowInSlice
         } // end of loop sliceId
 
         m_allRowsAvailableTime = x265_mdate();
-        tryWakeOne(); /* ensure one thread is active or help-wanted flag is set prior to blocking */
+        tryWakeOne(); //为了避免循环中的唤醒不成功，这里需要不断唤醒直到所有任务调度完成
         static const int block_ms = 250;
         while (m_completionEvent.timedWait(block_ms)) // 主线程阻塞等待所有行完成,每 250ms 醒来补唤醒一次
             tryWakeOne();
     }
     else
     {
-        // 主线:非 WPP 模式——单线程顺序逐行 压缩 + 滤波
+        // 非 WPP 模式——单线程顺序逐行 压缩 + 滤波
         for (uint32_t i = 0; i < m_numRows + m_filterRowDelay; i++)
         {
             // compress
             if (i < m_numRows)
             {
                 // block until all reference frames have reconstructed the rows we need
-                // 主线:顺序模式同样等待参考帧重建行
+                // 顺序模式同样等待参考帧重建行
                 for (int l = 0; l < numPredDir; l++)
                 {
                     int list = l;
@@ -923,7 +933,7 @@ void FrameEncoder::compressFrame()
                     m_row0WaitTime = x265_mdate();
                 else if (i == m_numRows - 1)
                     m_allRowsAvailableTime = x265_mdate();
-                processRowEncoder(i, m_tld[m_localTldIdx]); // 主线:本线程内压缩该行
+                processRowEncoder(i, m_tld[m_localTldIdx]); 
             }
 
             // filter
@@ -931,11 +941,12 @@ void FrameEncoder::compressFrame()
                 m_frameFilter.processRow(i - m_filterRowDelay); // 滤波滞后若干行启动
         }
     }
+    // 【不重要】编码完成后的质量评估及多 slice 哈希初始化。
 #if ENABLE_LIBVMAF
-    vmafFrameLevelScore(); // 旁路:VMAF 评分,主线可跳过
+    vmafFrameLevelScore(); //VMAF 评分  
 #endif
 
-    if (m_param->maxSlices > 1) // 旁路:多 slice 的 hash SEI 初始化,主线可跳过
+    if (m_param->maxSlices > 1) //    多 slice 的 hash SEI 初始化  
     {
         PicYuv *reconPic = m_frame->m_reconPic;
         uint32_t height = reconPic->m_picHeight;
@@ -943,9 +954,10 @@ void FrameEncoder::compressFrame()
     } 
 
     if (m_param->bDynamicRefine && m_top->m_startPoint <= m_frame->m_encodeOrder) //Avoid collecting data that will not be used by future frames.
-        collectDynDataFrame(); // 旁路:动态 refine 数据收集,主线可跳过
+        collectDynDataFrame(); // 动态 refine 数据收集  
 
-    if (m_param->rc.bStatWrite) // 旁路:2-pass 统计累加,主线可跳过
+    // 【不重要】以下两块只汇总 2-pass/CSV 日志所需的 CU 和失真统计。
+    if (m_param->rc.bStatWrite) //    2-pass 统计累加  
     {
         int totalI = 0, totalP = 0, totalSkip = 0;
 
@@ -965,7 +977,7 @@ void FrameEncoder::compressFrame()
         m_frame->m_encData->m_frameStats.percent8x8Skip  = (double)totalSkip / totalCuCount;
     }
 
-    if (m_param->csvLogLevel >= 1) // 旁路:CSV 统计累加,主线可跳过
+    if (m_param->csvLogLevel >= 1) //    CSV 统计累加  
     {
         for (uint32_t i = 0; i < m_numRows; i++)
         {
@@ -1003,7 +1015,7 @@ void FrameEncoder::compressFrame()
         }
     }
 
-    if (m_param->csvLogLevel >= 2) // 旁路:CSV 详细统计平均化,主线可跳过
+    if (m_param->csvLogLevel >= 2) //    CSV 详细统计平均化  
     {
         m_frame->m_encData->m_frameStats.avgLumaDistortion = (double)(m_frame->m_encData->m_frameStats.lumaDistortion) / m_frame->m_encData->m_frameStats.totalCtu;
         m_frame->m_encData->m_frameStats.avgChromaDistortion = (double)(m_frame->m_encData->m_frameStats.chromaDistortion) / m_frame->m_encData->m_frameStats.totalCtu;
@@ -1012,7 +1024,8 @@ void FrameEncoder::compressFrame()
         m_frame->m_encData->m_frameStats.avgResEnergy = (double)(m_frame->m_encData->m_frameStats.resEnergy) / m_frame->m_encData->m_frameStats.totalCtu;
     }
 
-    // 主线:开始写 slice 头与最终码流
+    // 【生成 Slice NAL】写 slice header，拼接 CTU 行子码流，最终放入 m_nalList。
+    // 开始写 slice 头与最终码流
     m_bs.resetBits();
     m_entropyCoder.load(m_initSliceContext);
     m_entropyCoder.setBitstream(&m_bs);
@@ -1023,7 +1036,7 @@ void FrameEncoder::compressFrame()
 
     m_entropyCoder.setBitstream(&m_bs);
 
-    if (m_param->maxSlices > 1) // 旁路:多 slice 头写入与子流序列化,主线可跳过
+    if (m_param->maxSlices > 1) //    多 slice 头写入与子流序列化  
     {
         uint32_t nextSliceRow = 0;
 
@@ -1059,7 +1072,7 @@ void FrameEncoder::compressFrame()
     }
     else
     {
-        // 主线:单 slice——写 slice 头,序列化子流,写 WPP 入口点
+        // 单 slice——写 slice 头,序列化子流,写 WPP 入口点
         if (m_param->bOptRefListLengthPPS)
         {
             ScopedLock refIdxLock(m_top->m_sliceRefIdxLock);
@@ -1079,10 +1092,11 @@ void FrameEncoder::compressFrame()
         m_nalList.serialize(slice->m_nalUnitType, m_bs);
     }
 
-    if (m_param->decodedPictureHashSEI) // 旁路:decoded picture hash SEI,主线可跳过
+    // 【不重要】输出重建图像校验值 SEI，供解码端校验一致性。
+    if (m_param->decodedPictureHashSEI) //    decoded picture hash SEI  
         writeTrailingSEIMessages();
 
-    // 主线:统计本 AU 的比特数(排除 SEI 与起始码)
+    // 统计本 AU 的比特数(排除 SEI 与起始码)
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < m_nalList.m_numNal; i++)
     {
@@ -1098,13 +1112,15 @@ void FrameEncoder::compressFrame()
     }
     m_accessUnitBits = bytes << 3;
 
+    // 【码控收尾】统计实际 AU 比特数并反馈给码率控制。
     int filler = 0;
     /* rateControlEnd may also block for earlier frames to call rateControlUpdateStats */
-    // 主线:通知码控本帧结束(可能阻塞等待前序帧),并获取 filler 字节数
+    // 通知码控本帧结束(可能阻塞等待前序帧),并获取 filler 字节数
     if (m_top->m_rateControl->rateControlEnd(m_frame, m_accessUnitBits, &m_rce, &filler) < 0)
         m_top->m_aborted = true;
 
-    if (filler > 0) // 旁路:VBV 填充数据 NAL,主线可跳过
+    // 【不重要】CBR/VBV 需要时插入 filler NAL 以补足目标码率。
+    if (filler > 0) //    VBV 填充数据 NAL  
     {
         filler = (filler - FILLER_OVERHEAD * 8) >> 3;
         m_bs.resetBits();
@@ -1120,7 +1136,8 @@ void FrameEncoder::compressFrame()
         m_accessUnitBits = bytes << 3;
     }
 
-    if (m_frame->m_rpu.payloadSize) // 旁路:Dolby Vision RPU NAL,主线可跳过
+    // 【不重要】封装 Dolby Vision RPU 元数据。
+    if (m_frame->m_rpu.payloadSize) //    Dolby Vision RPU NAL  
     {
         m_bs.resetBits();
         for (int i = 0; i < m_frame->m_rpu.payloadSize; i++)
@@ -1130,8 +1147,9 @@ void FrameEncoder::compressFrame()
 
     m_endCompressTime = x265_mdate(); // 记录压缩结束时间戳
 
+    // 【释放依赖】本帧不再使用参考帧，递减引用计数，使其之后可以回收。
     /* Decrement referenced frame reference counts, allow them to be recycled */
-    // 主线:递减参考帧的引用计数,允许其被回收
+    // 递减参考帧的引用计数,允许其被回收
     for (int l = 0; l < numPredDir; l++)
     {
         for (int ref = 0; ref < slice->m_numRefIdx[l]; ref++)
@@ -1141,7 +1159,8 @@ void FrameEncoder::compressFrame()
         }
     }
 
-    if (m_nr) // 旁路:NR 统计累加与系数回写,主线可跳过
+    // 【不重要】汇总各 worker 的降噪统计，并为后续帧更新降噪系数。
+    if (m_nr) //    NR 统计累加与系数回写  
     {
         bool nrEnabled = (m_rce.newQp < QP_MAX_SPEC || !m_param->rc.vbvBufferSize) && (m_param->noiseReductionIntra || m_param->noiseReductionInter);
 
@@ -1333,19 +1352,19 @@ void FrameEncoder::processRow(int row, int threadId)
 {
     int64_t startTime = x265_mdate(); // 记录本任务起始时间
     if (ATOMIC_INC(&m_activeWorkerCount) == 1 && m_stallStartTime)
-        m_totalNoWorkerTime += x265_mdate() - m_stallStartTime; // 第一个 worker 上线:累计此前无 worker 的停顿时间
+        m_totalNoWorkerTime += x265_mdate() - m_stallStartTime; // 最后一个空闲woker开始工作（无空闲woker）到当前的时间
 
-    const uint32_t realRow = m_idx_to_row[row >> 1]; // 队列索引 -> 实际行号(高 bit 是类型)
-    const uint32_t typeNum = m_idx_to_row[row & 1]; // 低 bit:0=编码任务, 1=滤波任务
+    const uint32_t realRow = m_idx_to_row[row >> 1]; // row是位图的一个位置，对应一个任务。位置/2 = 实际行号（因为每个行有两个任务：编码和滤波）
+    const uint32_t typeNum = m_idx_to_row[row & 1]; // 任务类型，低 bit:0=编码任务, 1=滤波任务
 
-    if (!typeNum)
-        processRowEncoder(realRow, m_tld[threadId]); // 主线:执行 CTU 行编码
-    else
+    if (!typeNum)//编码任务
+        processRowEncoder(realRow, m_tld[threadId]); //按行编码
+    else//滤波任务
     {
         m_frameFilter.processRow(realRow); // 执行该行去块/SAO 滤波
 
         // NOTE: Active next row
-        if (realRow != m_sliceBaseRow[m_rows[realRow].sliceId + 1] - 1)
+        if (realRow != m_sliceBaseRow[m_rows[realRow].sliceId + 1] - 1)//当前行 != 下一个slice的起始行的上一行（当前slice的末行），则下一行滤波任务入队
             enqueueRowFilter(m_row_to_idx[realRow + 1]); // 激活下一行的滤波任务
     }
 
@@ -1355,56 +1374,59 @@ void FrameEncoder::processRow(int row, int threadId)
     m_totalWorkerElapsedTime += x265_mdate() - startTime; // not thread safe, but good enough // 累计有效工作时间
 }
 
-// Called by worker threads
+/*
+ * 编码一个 CTU 行。WPP 开启时，worker 可能多次进入本函数：满足“上方行至少领先两个 CTU”
+ * 时继续向右编码，依赖不足时保存进度并返回，之后由波前调度器再次唤醒。
+ * 单个 CTU 的主路径为：初始化 -> 模式分析与重建 -> 推进 CABAC -> 放行滤波 -> 更新码控
+ * -> 推进下一行。VBV 判断需要调整 QP 时，还会回滚已生成的数据并触发重编码。
+ */
 void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 {
     const uint32_t row = (uint32_t)intRow;
     CTURow& curRow = m_rows[row];
 
+    // WPP 行状态由 worker 和调度器（给woker分配任务）共同访问，必须先在行锁保护下取得本次处理权。
     if (m_param->bEnableWavefront)
     {
         ScopedLock self(curRow.lock);
         if (!curRow.active)
-            /* VBV restart is in progress, exit out */
-            return; // VBV 重置中,本行已停用,直接退出
+            return; // VBV 回滚或依赖阻塞已停用该行，丢弃这个过期任务。
         if (curRow.busy)
         {
-            /* On multi-socket Windows servers, we have seen problems with
-             * ATOMIC_CAS which resulted in multiple worker threads processing
-             * the same CU row, which often resulted in bad pointer accesses. We
-             * believe the problem is fixed, but are leaving this check in place
-             * to prevent crashes in case it is not */
+            // 同一行被两个 worker 同时处理会破坏 CTU、CABAC 和统计状态；此处是防御性检查。
             x265_log(m_param, X265_LOG_WARNING,
                      "internal error - simultaneous row access detected. Please report HW to x265-devel@videolan.org\n");
-            return; // 防御性检查:避免多线程重复处理同一行
+            return;
         }
-        curRow.busy = true; // 标记本行正在被处理
+        curRow.busy = true;
     }
 
-    /* When WPP is enabled, every row has its own row coder instance. Otherwise
-     * they share row 0 */
-    Entropy& rowCoder = m_param->bEnableWavefront ? curRow.rowGoOnCoder : m_rows[0].rowGoOnCoder; // 主线:选取本行(或共享)熵编码器
+    // WPP 每行拥有独立 CABAC 子流；非 WPP 是连续子流，所有行共用第 0 行编码器。
+    // rowCoder 同时保存 CABAC 概率模型和算术编码状态。
+    Entropy& rowCoder = m_param->bEnableWavefront ? curRow.rowGoOnCoder : m_rows[0].rowGoOnCoder;
     FrameData& curEncData = *m_frame->m_encData;
     Slice *slice = curEncData.m_slice;
 
     const uint32_t numCols = m_numCols;
-    const uint32_t lineStartCUAddr = row * numCols; // 本行首个 CTU 地址
-    bool bIsVbv = m_param->rc.vbvBufferSize > 0 && m_param->rc.vbvMaxBitrate > 0; // 是否启用 VBV
+    const uint32_t lineStartCUAddr = row * numCols;
+    bool bIsVbv = m_param->rc.vbvBufferSize > 0 && m_param->rc.vbvMaxBitrate > 0;
 
+    // slice 内位置会影响 CABAC 初始化、运动搜索范围、WPP 继承、VBV 检查点和滤波收尾。
     const uint32_t sliceId = curRow.sliceId;
     uint32_t maxBlockCols = (m_frame->m_fencPic->m_picWidth + (16 - 1)) / 16;
     uint32_t noOfBlocks = m_param->maxCUSize / 16;
-    const uint32_t bFirstRowInSlice = ((row == 0) || (m_rows[row - 1].sliceId != curRow.sliceId)) ? 1 : 0; // 是否为 slice 首行
-    const uint32_t bLastRowInSlice = ((row == m_numRows - 1) || (m_rows[row + 1].sliceId != curRow.sliceId)) ? 1 : 0; // 是否为 slice 末行
+    const uint32_t bFirstRowInSlice = ((row == 0) || (m_rows[row - 1].sliceId != curRow.sliceId)) ? 1 : 0;
+    const uint32_t bLastRowInSlice = ((row == m_numRows - 1) || (m_rows[row + 1].sliceId != curRow.sliceId)) ? 1 : 0;
     const uint32_t endRowInSlicePlus1 = m_sliceBaseRow[sliceId + 1];
-    const uint32_t rowInSlice = row - m_sliceBaseRow[sliceId]; // 本行在 slice 内的相对行号
+    const uint32_t rowInSlice = row - m_sliceBaseRow[sliceId];
 
-    // Load SBAC coder context from previous row and initialize row state.
+    // slice 首行没有可继承的上方 WPP 行，首次进入时装入 slice 初始 CABAC 上下文。
     if (bFirstRowInSlice && !curRow.completed)        
-        rowCoder.load(m_initSliceContext); // slice 首行:加载初始 slice 熵上下文
+        rowCoder.load(m_initSliceContext);
 
-    // calculate mean QP for consistent deltaQP signalling calculation
-    if (m_param->bOptCUDeltaQP) // 旁路:CU 级 deltaQP 平均值计算,主线可跳过
+    // 【次要：CU delta-QP 优化】从 AQ/CU-tree 偏移计算平均 QP；WPP 按行计算，非 WPP
+    // 由第 0 行计算整帧后共享。锁与 avgQPComputed 保证重复唤醒时不会重复计算。
+    if (m_param->bOptCUDeltaQP)
     {
         ScopedLock self(curRow.lock);
         if (!curRow.avgQPComputed)
@@ -1461,33 +1483,37 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
         }
     }
 
-    // Initialize restrict on MV range in slices
-    tld.analysis.m_sliceMinY = -(int32_t)(rowInSlice * m_param->maxCUSize * 4) + 3 * 4; // MV 在 slice 内的 Y 向下限
-    tld.analysis.m_sliceMaxY = (int32_t)((endRowInSlicePlus1 - 1 - row) * (m_param->maxCUSize * 4) - 4 * 4); // MV 在 slice 内的 Y 向上限
+    // 垂直 MV 使用 1/4 像素单位：负值向上、正值向下。搜索范围限制在本 slice 内，
+    // 并在上下边界为亚像素插值分别保留 3 和 4 个整像素的访问余量。
+    tld.analysis.m_sliceMinY = -(int32_t)(rowInSlice * m_param->maxCUSize * 4) + 3 * 4;
+    tld.analysis.m_sliceMaxY = (int32_t)((endRowInSlicePlus1 - 1 - row) * (m_param->maxCUSize * 4) - 4 * 4);
 
-    // Handle single row slice
+    // 单行 slice 无法同时满足上下界，因此禁止垂直运动搜索。
     if (tld.analysis.m_sliceMaxY < tld.analysis.m_sliceMinY)
-        tld.analysis.m_sliceMaxY = tld.analysis.m_sliceMinY = 0; // 单行 slice:不限制 MV 范围
+        tld.analysis.m_sliceMaxY = tld.analysis.m_sliceMinY = 0;
 
 
-    while (curRow.completed < numCols) // 主线:CTU 循环——逐列压缩本行所有 CTU
+    // completed 既是完成数量，也是下一列索引：WPP 暂停后从这里续跑，VBV 回滚后清零重跑。
+    while (curRow.completed < numCols)
     {
         ProfileScopeEvent(encodeCTU);
 
-        const uint32_t col = curRow.completed; // 当前已完成的列数即待处理列
-        const uint32_t cuAddr = lineStartCUAddr + col; // 本 CTU 在帧内的线性地址
+        const uint32_t col = curRow.completed;
+        const uint32_t cuAddr = lineStartCUAddr + col;
         CUData* ctu = curEncData.getPicCTU(cuAddr);
         const uint32_t bLastCuInSlice = (bLastRowInSlice & (col == numCols - 1)) ? 1 : 0;
-        ctu->initCTU(*m_frame, cuAddr, slice->m_sliceQp, bFirstRowInSlice, bLastRowInSlice, bLastCuInSlice); // 初始化 CTU 元数据
+        // 重置 CTU 并写入位置、初始 QP 与 slice 边界；分析结果随后写回这个对象。
+        ctu->initCTU(*m_frame, cuAddr, slice->m_sliceQp, bFirstRowInSlice, bLastRowInSlice, bLastCuInSlice);
 
         if (bIsVbv)
         {
-            // 主线:VBV 模式下的 QP/代价准备
+            // VBV 可能要求提高 QP 重编码，先准备回滚快照、baseQp 和预测复杂度。
             if (col == 0 && !m_param->bEnableWavefront)
             {
-                m_backupStreams[0].copyBits(&m_outStreams[0]); // 备份码流,供 VBV 重编码回滚
+                // 非 WPP 共用一条子流；在行首保存上一行结束时的码流和 CABAC 状态。
+                m_backupStreams[0].copyBits(&m_outStreams[0]);
                 curRow.bufferedEntropy.copyState(rowCoder);
-                curRow.bufferedEntropy.loadContexts(rowCoder); // 备份 CABAC 上下文
+                curRow.bufferedEntropy.loadContexts(rowCoder);
             }
             if (bFirstRowInSlice && m_vbvResetTriggerRow != intRow)            
             {
@@ -1496,14 +1522,15 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
             }
 
             FrameData::RCStatCU& cuStat = curEncData.m_cuStat[cuAddr];
+            // WPP 当前 CTU 从上一行右侧一列继承 baseQp；非 WPP 从上一行最终 rowQp 继承。
             if (m_param->bEnableWavefront && rowInSlice >= col && !bFirstRowInSlice && m_vbvResetTriggerRow != intRow)
-                cuStat.baseQp = curEncData.m_cuStat[cuAddr - numCols + 1].baseQp; // WPP:从对角线左下 CTU 继承 baseQp
+                cuStat.baseQp = curEncData.m_cuStat[cuAddr - numCols + 1].baseQp;
             else if (!m_param->bEnableWavefront && !bFirstRowInSlice && m_vbvResetTriggerRow != intRow)
-                cuStat.baseQp = curEncData.m_rowStat[row - 1].rowQp; // 非 WPP:从上一行继承
+                cuStat.baseQp = curEncData.m_rowStat[row - 1].rowQp;
             else
                 cuStat.baseQp = curEncData.m_rowStat[row].rowQp;
 
-            /* TODO: use defines from slicetype.h for lowres block size */
+            // 【次要：VBV 复杂度估计】汇总 CTU 覆盖的 16x16 lookahead 块代价，边界处裁剪。
             uint32_t block_y = (ctu->m_cuPelY >> m_param->maxLog2CUSize) * noOfBlocks;
             uint32_t block_x = (ctu->m_cuPelX >> m_param->maxLog2CUSize) * noOfBlocks;
             if (!m_param->analysisLoad || !m_param->bDisableLookahead)
@@ -1517,100 +1544,95 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 
                     for (uint32_t w = 0; w < noOfBlocks && (block_x + w) < maxBlockCols; w++, idx++)
                     {
-                        cuStat.vbvCost += m_frame->m_lowres.lowresCostForRc[idx] & LOWRES_COST_MASK; // 累加 lowres 代价用于 VBV
+                        cuStat.vbvCost += m_frame->m_lowres.lowresCostForRc[idx] & LOWRES_COST_MASK;
                         cuStat.intraVbvCost += m_frame->m_lowres.intraCost[idx];
                     }
                 }
             }
         }
         else
-            curEncData.m_cuStat[cuAddr].baseQp = curEncData.m_avgQpRc; // 非 VBV:统一 baseQp
+            curEncData.m_cuStat[cuAddr].baseQp = curEncData.m_avgQpRc;
 
+        // WPP 行首从上一行编码完第 2 个 CTU 后保存的概率模型同步 CABAC，而不是继承行末状态。
         if (m_param->bEnableWavefront && !col && !bFirstRowInSlice)
         {
-            // Load SBAC coder context from previous row and initialize row state.
-            // 主线:WPP 非 slice 首行的第 0 列——从上一行保存的上下文恢复 CABAC
             rowCoder.copyState(m_initSliceContext);
             rowCoder.loadContexts(m_rows[row - 1].bufferedEntropy);
         }
         if (m_param->dynamicRd && (int32_t)(m_rce.qpaRc - m_rce.qpNoVbv) > 0)
             ctu->m_vbvAffected = true;
 
-        // Does all the CU analysis, returns best top level mode decision
-        Mode& best = tld.analysis.compressCTU(*ctu, *m_frame, m_cuGeoms[m_ctuGeomMap[cuAddr]], rowCoder); // 主线:CU 分析与模式决策,返回最佳模式
+        // 本函数最大的性能热点：递归决定 CU/PU/TU 划分，完成帧内/帧间搜索、变换量化、
+        // 重建和率失真比较，最终返回顶层最佳模式。实际算法优化通常从该调用向下展开。
+        Mode& best = tld.analysis.compressCTU(*ctu, *m_frame, m_cuGeoms[m_ctuGeomMap[cuAddr]], rowCoder);
 
-        /* startPoint > encodeOrder is true when the start point changes for
-        a new GOP but few frames from the previous GOP is still incomplete.
-        The data of frames in this interval will not be used by any future frames. */
+        // 【次要：动态 refine】只收集未来仍可能使用的帧数据，跳过 GOP 切换后未完成的旧帧。
         if (m_param->bDynamicRefine && m_top->m_startPoint <= m_frame->m_encodeOrder)
-            collectDynDataRow(*ctu, &curRow.rowStats); // 旁路:动态 refine 数据收集,主线可跳过
+            collectDynDataRow(*ctu, &curRow.rowStats);
 
-        // take a sample of the current active worker count
-        ATOMIC_ADD(&m_totalActiveWorkerCount, m_activeWorkerCount); // 采样活跃 worker 数
+        // 【次要：性能统计】采样活跃 worker 数，用于计算并行利用率。
+        ATOMIC_ADD(&m_totalActiveWorkerCount, m_activeWorkerCount);
         ATOMIC_INC(&m_activeWorkerCountSamples);
 
-        /* advance top-level row coder to include the context of this CTU.
-         * if SAO is disabled, rowCoder writes the final CTU bitstream */
-        rowCoder.encodeCTU(*ctu, m_cuGeoms[m_ctuGeomMap[cuAddr]]); // 主线:用 CABAC 编码本 CTU 的最终码流
+        // 用最终语法元素推进 CABAC。无 SAO 时同时写出 CTU 比特流；有 SAO 时这里只推进上下文，
+        // 因为 SAO 语法位于 CTU 语法之前，最终输出会延迟到后续阶段。
+        rowCoder.encodeCTU(*ctu, m_cuGeoms[m_ctuGeomMap[cuAddr]]);
 
+        // WPP 同步点：编码完本行第 2 个 CTU 后保存概率模型，供下一行第 1 个 CTU 使用。
         if (m_param->bEnableWavefront && col == 1)
-            // Save CABAC state for next row
-            curRow.bufferedEntropy.loadContexts(rowCoder); // 第 1 列完成后保存 CABAC,供下一行第 0 列恢复
+            curRow.bufferedEntropy.loadContexts(rowCoder);
 
-        /* SAO parameter estimation using non-deblocked pixels for CTU bottom and right boundary areas */
+        // 使用去块前像素估计 SAO 时，必须在滤波改写 CTU 下边界和右边界前完成统计。
         if (slice->m_bUseSao && m_param->bSaoNonDeblocked)
-            m_frameFilter.m_parallelFilter[row].m_sao.calcSaoStatsCu_BeforeDblk(m_frame, col, row); // 主线:SAO 统计(去块前像素)
+            m_frameFilter.m_parallelFilter[row].m_sao.calcSaoStatsCu_BeforeDblk(m_frame, col, row);
 
-        /* Deblock with idle threading */
+        // 编码与滤波按行流水：当前 CTU 重建后放行较早行的滤波，避免修改仍被预测读取的像素。
         if (m_param->bEnableLoopFilter | slice->m_bUseSao)
         {
-            // NOTE: in VBV mode, we may reencode anytime, so we can't do Deblock stage-Horizon and SAO
-            if (!bIsVbv) // VBV 模式可能重编码,不能提前去块
+            // VBV 可能回滚重建结果，因此在检查点确认前不能提前执行不可回滚的滤波。
+            if (!bIsVbv)
             {
-                // Delay one row to avoid intra prediction conflict
                 if (m_pool && !bFirstRowInSlice)
                 {                    
                     int allowCol = col;
 
-                    // avoid race condition on last column
+                    // 行尾取编码进度与前两行滤波进度的较小值，避免边界收尾时产生竞争。
                     if (rowInSlice >= 2)
                     {
                         allowCol = X265_MIN(((col == numCols - 1) ? m_frameFilter.m_parallelFilter[row - 2].m_lastDeblocked.get()
                                                                   : m_frameFilter.m_parallelFilter[row - 2].m_lastCol.get()), (int)col);
                     }
-                    m_frameFilter.m_parallelFilter[row - 1].m_allowedCol.set(allowCol); // 主线:推进上一行的去块进度
+                    m_frameFilter.m_parallelFilter[row - 1].m_allowedCol.set(allowCol);
                 }
 
-                // Last Row may start early
+                // slice 末行没有下一编码行来放行它，因此由末行自身同步推进滤波。
                 if (m_pool && bLastRowInSlice)
                 {
-                    // Deblocking last row
                     int allowCol = col;
 
-                    // avoid race condition on last column
                     if (rowInSlice >= 2)
                     {
                         allowCol = X265_MIN(((col == numCols - 1) ? m_frameFilter.m_parallelFilter[row - 1].m_lastDeblocked.get()
                                                                   : m_frameFilter.m_parallelFilter[row - 1].m_lastCol.get()), (int)col);
                     }
-                    m_frameFilter.m_parallelFilter[row].m_allowedCol.set(allowCol); // 末行可提前去块
+                    m_frameFilter.m_parallelFilter[row].m_allowedCol.set(allowCol);
                 }
-            } // end of !bIsVbv
+            }
         }
-        // Both Loopfilter and SAO Disabled
         else
         {
-            m_frameFilter.m_parallelFilter[row].processPostCu(col); // 无滤波:仅做后处理(如重建行就绪通知)
+            // 即使 Deblock/SAO 都关闭，也要更新重建进度并通知等待参考像素的线程。
+            m_frameFilter.m_parallelFilter[row].processPostCu(col);
         }
 
-        // Completed CU processing
-        curRow.completed++; // 本行已完成列数 +1
+        // CTU 的分析、重建、CABAC 推进和滤波放行完成后，才提交行进度。
+        curRow.completed++;
 
+        // 【次要：编码统计】累计 QP、失真、能量和 CU 分布，供日志、二遍编码及分析文件使用。
         FrameStats frameLog;
-        curEncData.m_rowStat[row].sumQpAq += collectCTUStatistics(*ctu, &frameLog); // 累加本 CTU 的 QP/统计
+        curEncData.m_rowStat[row].sumQpAq += collectCTUStatistics(*ctu, &frameLog);
 
-        // copy number of intra, inter cu per row into frame stats for 2 pass
-        if (m_param->rc.bStatWrite) // 旁路:2-pass 行统计累加,主线可跳过
+        if (m_param->rc.bStatWrite)
         {
             curRow.rowStats.mvBits    += best.mvBits;
             curRow.rowStats.coeffBits += best.coeffBits;
@@ -1618,7 +1640,7 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 
             for (uint32_t depth = 0; depth <= m_param->maxCUDepth; depth++)
             {
-                /* 1 << shift == number of 8x8 blocks at current depth */
+                // 将不同深度的 CU 数折算为统一的等效 8x8 块数。
                 int shift = 2 * (m_param->maxCUDepth - depth);
                 int cuSize = m_param->maxCUSize >> depth;
 
@@ -1652,38 +1674,38 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 
         if (bIsVbv)
         {   
-            // Update encoded bits, satdCost, baseQP for each CU if tune grain is disabled
+            // 登记实际比特数与预测复杂度。WPP + const-VBV 按对角线集中汇总，避免重复累计。
             FrameData::RCStatCU& cuStat = curEncData.m_cuStat[cuAddr];    
             if ((m_param->bEnableWavefront && ((cuAddr == m_sliceBaseRow[sliceId] * numCols) || !m_param->rc.bEnableConstVbv)) || !m_param->bEnableWavefront)
             {
-                curEncData.m_rowStat[row].rowSatd += cuStat.vbvCost; // 行级 VBV 代价累加
+                curEncData.m_rowStat[row].rowSatd += cuStat.vbvCost;
                 curEncData.m_rowStat[row].rowIntraSatd += cuStat.intraVbvCost;
-                curEncData.m_rowStat[row].encodedBits += cuStat.totalBits; // 行级已编码比特累加
+                curEncData.m_rowStat[row].encodedBits += cuStat.totalBits;
                 curEncData.m_rowStat[row].sumQpRc += cuStat.baseQp;
                 curEncData.m_rowStat[row].numEncodedCUs = cuAddr;
             }
             
-            // If current block is at row end checkpoint, call vbv ratecontrol.
-            // 主线:非 WPP 行末——调用行级 VBV 码控,决定是否需要重编码
+            // 非 WPP 在行末以完整行数据调用 VBV 码控；负返回值表示 QP 跳变较大，需要撤销本行。
             if (!m_param->bEnableWavefront && col == numCols - 1)
             {
                 double qpBase = curEncData.m_cuStat[cuAddr].baseQp;
-                curRow.reEncode = m_top->m_rateControl->rowVbvRateControl(m_frame, row, &m_rce, qpBase, m_sliceBaseRow, sliceId); // 行级 VBV 决策
+                curRow.reEncode = m_top->m_rateControl->rowVbvRateControl(m_frame, row, &m_rce, qpBase, m_sliceBaseRow, sliceId);
                 qpBase = x265_clip3((double)m_param->rc.qpMin, (double)m_param->rc.qpMax, qpBase);
                 curEncData.m_rowStat[row].rowQp = qpBase;
                 curEncData.m_rowStat[row].rowQpScale = x265_qp2qScale(qpBase);
-                if (curRow.reEncode < 0) // 需要重编码:回滚码流与 CABAC 上下文,重置本行
+                if (curRow.reEncode < 0)
                 {
                     x265_log(m_param, X265_LOG_DEBUG, "POC %d row %d - encode restart required for VBV, to %.2f from %.2f\n",
                         m_frame->m_poc, row, qpBase, curEncData.m_cuStat[cuAddr].baseQp);
 
                     m_vbvResetTriggerRow = row;
-                    m_outStreams[0].copyBits(&m_backupStreams[0]); // 恢复备份码流
+                    // 恢复行首码流和 CABAC 快照，清空旧 QP 的统计；while 随后从第 0 列重跑。
+                    m_outStreams[0].copyBits(&m_backupStreams[0]);
 
                     rowCoder.copyState(curRow.bufferedEntropy);
-                    rowCoder.loadContexts(curRow.bufferedEntropy); // 恢复备份 CABAC
+                    rowCoder.loadContexts(curRow.bufferedEntropy);
 
-                    curRow.completed = 0; // 重置已完成列,重新开始本行
+                    curRow.completed = 0;
                     memset(&curRow.rowStats, 0, sizeof(curRow.rowStats));
                     curEncData.m_rowStat[row].numEncodedCUs = 0;
                     curEncData.m_rowStat[row].encodedBits = 0;
@@ -1693,10 +1715,10 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
                     curEncData.m_rowStat[row].sumQpAq = 0;
                 }
             }
-            // If current block is at row diagonal checkpoint, call vbv ratecontrol.
-            // 主线:WPP 对角线检查点——在 rowInSlice==col 处做行级 VBV 决策
+            // WPP 不能等待普通行末：col == rowInSlice 时已编码区域形成稳定对角线，可执行 VBV 决策。
             else if (m_param->bEnableWavefront && rowInSlice == col && !bFirstRowInSlice)
             {
+                // const-VBV 沿对角线向上补齐各行尚未登记的 CTU，形成确定且不重复的统计区域。
                 if (m_param->rc.bEnableConstVbv)
                 {
                     uint32_t startCuAddr = numCols * row;
@@ -1719,19 +1741,20 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
                     }
                 }
                 double qpBase = curEncData.m_cuStat[cuAddr].baseQp;
-                curRow.reEncode = m_top->m_rateControl->rowVbvRateControl(m_frame, row, &m_rce, qpBase, m_sliceBaseRow, sliceId); // WPP 行级 VBV 决策
+                curRow.reEncode = m_top->m_rateControl->rowVbvRateControl(m_frame, row, &m_rce, qpBase, m_sliceBaseRow, sliceId);
                 qpBase = x265_clip3((double)m_param->rc.qpMin, (double)m_param->rc.qpMax, qpBase);
                 curEncData.m_rowStat[row].rowQp = qpBase;
                 curEncData.m_rowStat[row].rowQpScale = x265_qp2qScale(qpBase);
 
-                if (curRow.reEncode < 0) // 主线:WPP VBV 重置——停止后续行,回滚本行及以上所有行
+                if (curRow.reEncode < 0)
                 {
                     x265_log(m_param, X265_LOG_DEBUG, "POC %d row %d - encode restart required for VBV, to %.2f from %.2f\n",
                              m_frame->m_poc, row, qpBase, curEncData.m_cuStat[cuAddr].baseQp);
 
-                    // prevent the WaveFront::findJob() method from providing new jobs
+                    // 下方行可能已使用本行的重建像素与 CABAC 同步状态，因此必须先封锁调度，
+                    // 再从 slice 末行倒序停止并清空触发行及其下方所有受影响行。
                     m_vbvResetTriggerRow = row;
-                    m_bAllRowsStop = true; // 全行停止,阻止新任务派发
+                    m_bAllRowsStop = true;
 
                     for (uint32_t r = m_sliceBaseRow[sliceId + 1] - 1; r >= row; r--)
                     {
@@ -1739,15 +1762,14 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 
                         if (r != row)
                         {
-                            /* if row was active (ready to be run) clear active bit and bitmap bit for this row */
+                            // 未开始的任务直接出队；已被 worker 取走时释放锁并等待其观察停止条件退出。
                             stopRow.lock.acquire();
                             while (stopRow.active)
                             {
                                 if (dequeueRow(r * 2))
-                                    stopRow.active = false; // 出队未开始的行
+                                    stopRow.active = false;
                                 else
                                 {
-                                    /* we must release the row lock to allow the thread to exit */
                                     stopRow.lock.release();
                                     GIVE_UP_TIME();
                                     stopRow.lock.acquire();
@@ -1764,14 +1786,15 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
 
                                 if (bRowBusy)
                                 {
-                                    GIVE_UP_TIME(); // 等待正在处理的行退出
+                                    GIVE_UP_TIME();
                                 }
                             }
                             while (bRowBusy);
                         }
 
-                        m_outStreams[r].resetBits(); // 清空各行码流
-                        stopRow.completed = 0; // 重置各行完成列数
+                        // 清除旧 QP 生成的子流、断点与统计，后续重新分析会覆盖 CTU 内容。
+                        m_outStreams[r].resetBits();
+                        stopRow.completed = 0;
                         memset(&stopRow.rowStats, 0, sizeof(stopRow.rowStats));
                         curEncData.m_rowStat[r].numEncodedCUs = 0;
                         curEncData.m_rowStat[r].encodedBits = 0;
@@ -1781,32 +1804,33 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
                         curEncData.m_rowStat[r].sumQpAq = 0;
                     }
 
-                    m_bAllRowsStop = false; // 恢复调度
+                    m_bAllRowsStop = false;
                 }
             }
         }
 
+        // WPP 核心推进规则：本行至少领先下一行两个 CTU 才激活它，既保证 CABAC 同步点，
+        // 也满足上方和右上方重建像素依赖。
         if (m_param->bEnableWavefront && curRow.completed >= 2 && !bLastRowInSlice &&
             (!m_bAllRowsStop || intRow + 1 < m_vbvResetTriggerRow))
         {
-            /* activate next row */
-            // 主线:WPP 行激活——本行完成 >=2 列后唤醒下一行(波前推进)
             ScopedLock below(m_rows[row + 1].lock);
 
             if (m_rows[row + 1].active == false &&
-                m_rows[row + 1].completed + 2 <= curRow.completed)
+                m_rows[row + 1].completed + 2 <= curRow.completed)//满足上方行比下方行领先2CTU并且下方行，之前没有满足内部依赖（active == false）
             {
-                m_rows[row + 1].active = true;
-                enqueueRowEncoder(m_row_to_idx[row + 1]); // 入队下一行
-                tryWakeOne(); /* wake up a sleeping thread or set the help wanted flag */
+                m_rows[row + 1].active = true;//设置为满足内部依赖
+                enqueueRowEncoder(m_row_to_idx[row + 1]);//下一行加入调度队列
+                tryWakeOne();
             }
         }
 
+        // 上方行领先量不足或 VBV 正在回滚时，将 completed 作为断点保存，释放本行并返回；
+        // 上方行继续推进后会重新激活这里。
         ScopedLock self(curRow.lock);
         if ((m_bAllRowsStop && intRow > m_vbvResetTriggerRow) ||
             (!bFirstRowInSlice && ((curRow.completed < numCols - 1) || (m_rows[row - 1].completed < numCols)) && m_rows[row - 1].completed < curRow.completed + 2))
         {
-            // 主线:行阻塞——上一行进度不足或 VBV 停止,本行挂起等待
             curRow.active = false;
             curRow.busy = false;
             ATOMIC_INC(&m_countRowBlocks);
@@ -1814,8 +1838,8 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
         }
     }
 
-    /* this row of CTUs has been compressed */
-    if (m_param->bEnableWavefront && m_param->rc.bEnableConstVbv) // 旁路:const VBV 末行统计补全,主线可跳过
+    // 【次要：const-VBV 收尾】slice 末行完成后补齐对角线检查点未覆盖的右侧 CTU 统计。
+    if (m_param->bEnableWavefront && m_param->rc.bEnableConstVbv)
     {
         if (bLastRowInSlice)       
         {
@@ -1833,13 +1857,8 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
         }
     }
 
-    /* If encoding with ABR, update update bits and complexity in rate control
-     * after a number of rows so the next frame's rateControlStart has more
-     * accurate data for estimation. At the start of the encode we update stats
-     * after half the frame is encoded, but after this initial period we update
-     * after refLagRows (the number of rows reference frames must have completed
-     * before referencees may begin encoding) */
-    // 主线:ABR/VBV 中途统计更新——在特定行向码控回传本帧已编码数据,提升下一帧估算精度
+    // ABR/VBV 在帧中途反馈已编码比特与复杂度：启动期约在半帧处，稳定后约在 refLagRows
+    // 处更新，使其他帧的 rateControlStart 尽早获得较准确的实际数据。
     if (m_param->rc.rateControlMode == X265_RC_ABR || bIsVbv)
     {
         uint32_t rowCount = 0;
@@ -1869,48 +1888,48 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
                     m_rowSliceTotalBits[sliceId] += curEncData.m_cuStat[cuAddr].totalBits;
             }
 
-            if (ATOMIC_INC(&m_sliceCnt) == (int)m_param->maxSlices) // 所有 slice 都到位后,统一更新码控
+            // 多 slice 并行到达；仅由最后到达者汇总全部 slice 并更新一次全局码控模型。
+            if (ATOMIC_INC(&m_sliceCnt) == (int)m_param->maxSlices)
             {
                 m_rce.rowTotalBits = 0;
                 for (uint32_t i = 0; i < m_param->maxSlices; i++)
                     m_rce.rowTotalBits += m_rowSliceTotalBits[i];
-                m_top->m_rateControl->rateControlUpdateStats(&m_rce); // 主线:回传行级统计给码控
+                m_top->m_rateControl->rateControlUpdateStats(&m_rce);
             }
         }
     }
 
-    /* flush row bitstream (if WPP and no SAO) or flush frame if no WPP and no SAO */
-    /* end_of_sub_stream_one_bit / end_of_slice_segment_flag */
+    // 无 SAO 时 CTU 语法已直接写入 rowCoder：WPP 在每行结束子流，非 WPP 只在 slice 末行
+    // 结束连续子流。finishSlice 写入结束标志并刷新 CABAC 尾部。
        if (!slice->m_bUseSao && (m_param->bEnableWavefront || bLastRowInSlice))
-               rowCoder.finishSlice(); // 主线:写子流结束标志(WPP 行尾)或 slice 结束标志
+               rowCoder.finishSlice();
 
 
-    /* Processing left Deblock block with current threading */
+    // 前两行去块完成后，当前编码线程可接管上一行剩余滤波，利用空闲算力减少调度开销。
     if ((m_param->bEnableLoopFilter | slice->m_bUseSao) & (rowInSlice >= 2))
     {
-        /* Check conditional to start previous row process with current threading */
         if (m_frameFilter.m_parallelFilter[row - 2].m_lastDeblocked.get() == (int)numCols)
         {
-            /* stop threading on current row and restart it */
-            m_frameFilter.m_parallelFilter[row - 1].m_allowedCol.set(numCols); // 主线:本线程接管上一行的去块
+            m_frameFilter.m_parallelFilter[row - 1].m_allowedCol.set(numCols);
             m_frameFilter.m_parallelFilter[row - 1].processTasks(-1);
         }
     }
 
-    /* trigger row-wise loop filters */
-    if (m_param->bEnableWavefront) // 主线:WPP 行级滤波触发
+    // 滤波必须落后编码 m_filterRowDelay 行，避免改写仍被预测读取的重建像素；到达延迟后
+    // 逐行解锁，slice 末尾再放行尾部未触发的所有行。
+    if (m_param->bEnableWavefront)
     {
         if (rowInSlice >= m_filterRowDelay)
         {
-            enableRowFilter(m_row_to_idx[row - m_filterRowDelay]); // 启用延迟若干行后的滤波任务
+            enableRowFilter(m_row_to_idx[row - m_filterRowDelay]);
 
-            /* NOTE: Activate filter if first row (row 0) */
+            // 第一条滤波行没有前驱任务来激活，必须显式入队；之后由滤波流水线逐行推进。
             if (rowInSlice == m_filterRowDelay)
-                enqueueRowFilter(m_row_to_idx[row - m_filterRowDelay]); // 入队首个滤波行
+                enqueueRowFilter(m_row_to_idx[row - m_filterRowDelay]);
             tryWakeOne();
         }
 
-        if (bLastRowInSlice) // slice 末行:启用剩余所有滤波行
+        if (bLastRowInSlice)
         {
             for (uint32_t i = endRowInSlicePlus1 - m_filterRowDelay; i < endRowInSlicePlus1; i++)
             {
@@ -1919,18 +1938,18 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld)
             tryWakeOne();
         }
 
-        // handle specially case - single row slice
-        if  (bFirstRowInSlice & bLastRowInSlice) // 单行 slice:直接入队自身滤波
+        // 单行 slice 不会经过跨行激活链，直接把自身滤波任务入队。
+        if  (bFirstRowInSlice & bLastRowInSlice)
         {
             enqueueRowFilter(m_row_to_idx[row]);
             tryWakeOne();
         }
     }
 
-    curRow.busy = false; // 清除本行忙碌标志
+    // 每个 CTU 行的编码任务和滤波任务各贡献一次完成计数；达到 2 * m_numRows 表示整帧完成。
+    curRow.busy = false;
 
-    // CHECK_ME: Does it always FALSE condition?
-    if (ATOMIC_INC(&m_completionCount) == 2 * (int)m_numRows) // 主线:所有行(编码+滤波)完成时触发完成事件
+    if (ATOMIC_INC(&m_completionCount) == 2 * (int)m_numRows)
         m_completionEvent.trigger();
 }
 
